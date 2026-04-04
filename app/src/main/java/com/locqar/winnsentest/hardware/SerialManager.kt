@@ -9,8 +9,7 @@ import android.hardware.usb.UsbDevice
 import android.hardware.usb.UsbManager
 import android.os.Build
 import android.util.Log
-import com.hoho.android.usbserial.driver.UsbSerialPort
-import com.hoho.android.usbserial.driver.UsbSerialProber
+import com.hoho.android.usbserial.driver.*
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.asStateFlow
 
@@ -35,6 +34,10 @@ class SerialManager(private val context: Context) {
 
     private val _connectedDeviceName = MutableStateFlow<String?>(null)
     val connectedDeviceName = _connectedDeviceName.asStateFlow()
+
+    // All USB devices visible to the tablet (for debug display)
+    private val _detectedDevices = MutableStateFlow<List<String>>(emptyList())
+    val detectedDevices = _detectedDevices.asStateFlow()
 
     val isConnected: Boolean get() = _connectionState.value == ConnectionState.CONNECTED
 
@@ -66,14 +69,73 @@ class SerialManager(private val context: Context) {
         }
     }
 
+    /**
+     * Scan all USB devices and list them for debugging.
+     * Then try to find a serial driver (default prober + custom CDC/ACM fallback).
+     */
     fun connect() {
-        val availableDrivers = UsbSerialProber.getDefaultProber().findAllDrivers(usbManager)
-        if (availableDrivers.isEmpty()) {
+        // Step 1: Log ALL USB devices the tablet can see
+        val allDevices = usbManager.deviceList
+        val deviceInfo = mutableListOf<String>()
+
+        if (allDevices.isEmpty()) {
+            deviceInfo.add("No USB devices detected at all")
+            _detectedDevices.value = deviceInfo
             _connectionState.value = ConnectionState.ERROR
-            _errorMessage.value = "No USB-to-RS485 adapter found"
+            _errorMessage.value = "No USB devices found. Check USB cable."
+            Log.w(TAG, "No USB devices found")
             return
         }
 
+        for ((name, device) in allDevices) {
+            val info = "VID:${"%04X".format(device.vendorId)} PID:${"%04X".format(device.productId)} " +
+                "${device.productName ?: "Unknown"} [${device.deviceName}] " +
+                "class=${device.deviceClass} interfaces=${device.interfaceCount}"
+            deviceInfo.add(info)
+            Log.i(TAG, "USB device: $info")
+        }
+        _detectedDevices.value = deviceInfo
+
+        // Step 2: Try default prober (CH340, FTDI, PL2303, CP210x)
+        var availableDrivers = UsbSerialProber.getDefaultProber().findAllDrivers(usbManager)
+
+        // Step 3: If no standard drivers found, try CDC/ACM driver on all devices
+        // (Winnsen boards may present as CDC/ACM serial devices)
+        if (availableDrivers.isEmpty()) {
+            Log.i(TAG, "No standard drivers. Trying CDC/ACM on all ${allDevices.size} devices...")
+
+            val customTable = ProbeTable()
+            for ((_, device) in allDevices) {
+                // Try CDC/ACM driver for each device
+                customTable.addProduct(device.vendorId, device.productId, CdcAcmSerialDriver::class.java)
+            }
+            val customProber = UsbSerialProber(customTable)
+            availableDrivers = customProber.findAllDrivers(usbManager)
+
+            if (availableDrivers.isEmpty()) {
+                // Step 4: Last resort — try all driver types
+                Log.i(TAG, "CDC/ACM failed. Trying all driver types...")
+                val bruteTable = ProbeTable()
+                for ((_, device) in allDevices) {
+                    bruteTable.addProduct(device.vendorId, device.productId, Ch34xSerialDriver::class.java)
+                    bruteTable.addProduct(device.vendorId, device.productId, FtdiSerialDriver::class.java)
+                    bruteTable.addProduct(device.vendorId, device.productId, ProlificSerialDriver::class.java)
+                    bruteTable.addProduct(device.vendorId, device.productId, Cp21xxSerialDriver::class.java)
+                }
+                val bruteProber = UsbSerialProber(bruteTable)
+                availableDrivers = bruteProber.findAllDrivers(usbManager)
+            }
+        }
+
+        if (availableDrivers.isEmpty()) {
+            val devList = deviceInfo.joinToString("\n")
+            _connectionState.value = ConnectionState.ERROR
+            _errorMessage.value = "Found ${allDevices.size} USB device(s) but none recognized as serial.\n$devList"
+            Log.w(TAG, "No serial drivers matched")
+            return
+        }
+
+        Log.i(TAG, "Found ${availableDrivers.size} serial driver(s)")
         val driver = availableDrivers[0]
         val device = driver.device
 
@@ -92,9 +154,36 @@ class SerialManager(private val context: Context) {
 
     private fun openDevice(device: UsbDevice) {
         try {
-            val drivers = UsbSerialProber.getDefaultProber().findAllDrivers(usbManager)
-            val driver = drivers.find { it.device == device }
-                ?: throw IllegalStateException("Driver not found")
+            // Try all probers to find the right driver
+            var driver = UsbSerialProber.getDefaultProber().findAllDrivers(usbManager)
+                .find { it.device == device }
+
+            if (driver == null) {
+                // Try CDC/ACM
+                val customTable = ProbeTable()
+                customTable.addProduct(device.vendorId, device.productId, CdcAcmSerialDriver::class.java)
+                driver = UsbSerialProber(customTable).findAllDrivers(usbManager)
+                    .find { it.device == device }
+            }
+
+            if (driver == null) {
+                // Try all types
+                val driverTypes = listOf(
+                    Ch34xSerialDriver::class.java,
+                    FtdiSerialDriver::class.java,
+                    ProlificSerialDriver::class.java,
+                    Cp21xxSerialDriver::class.java
+                )
+                for (driverType in driverTypes) {
+                    val table = ProbeTable()
+                    table.addProduct(device.vendorId, device.productId, driverType)
+                    driver = UsbSerialProber(table).findAllDrivers(usbManager)
+                        .find { it.device == device }
+                    if (driver != null) break
+                }
+            }
+
+            if (driver == null) throw IllegalStateException("No driver found for VID:${"%04X".format(device.vendorId)} PID:${"%04X".format(device.productId)}")
 
             val connection = usbManager.openDevice(device)
                 ?: throw IllegalStateException("Could not open USB device")
@@ -105,7 +194,7 @@ class SerialManager(private val context: Context) {
 
             serialPort = port
             _connectionState.value = ConnectionState.CONNECTED
-            _connectedDeviceName.value = "${device.productName ?: "USB"} (${device.deviceName})"
+            _connectedDeviceName.value = "VID:${"%04X".format(device.vendorId)} PID:${"%04X".format(device.productId)} ${device.productName ?: ""} (${device.deviceName})"
             _errorMessage.value = null
             Log.i(TAG, "Connected to ${device.deviceName} at $BAUD_RATE baud")
         } catch (e: Exception) {

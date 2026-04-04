@@ -49,6 +49,7 @@ fun TabletTestScreen(vm: TestViewModel = viewModel()) {
     val connState by vm.serial.connectionState.collectAsStateWithLifecycle()
     val deviceName by vm.serial.connectedDeviceName.collectAsStateWithLifecycle()
     val errorMsg by vm.serial.errorMessage.collectAsStateWithLifecycle()
+    val detectedDevices by vm.serial.detectedDevices.collectAsStateWithLifecycle()
     val doorStates by vm.doorStates.collectAsStateWithLifecycle()
     val logEntries by vm.log.collectAsStateWithLifecycle()
     val autoPolling by vm.autoPolling.collectAsStateWithLifecycle()
@@ -139,6 +140,33 @@ fun TabletTestScreen(vm: TestViewModel = viewModel()) {
                             if (isConnected) "Disconnect" else "Connect",
                             fontSize = 16.sp
                         )
+                    }
+                }
+            }
+
+            // Show detected USB devices (debug info)
+            if (detectedDevices.isNotEmpty() && !isConnected) {
+                Spacer(Modifier.height(8.dp))
+                Card(
+                    modifier = Modifier.fillMaxWidth(),
+                    colors = CardDefaults.cardColors(containerColor = Color(0xFF1A1A2E))
+                ) {
+                    Column(modifier = Modifier.padding(12.dp)) {
+                        Text(
+                            "Detected USB Devices:",
+                            fontSize = 14.sp,
+                            fontWeight = FontWeight.Bold,
+                            color = Color(0xFFFFB74D)
+                        )
+                        Spacer(Modifier.height(4.dp))
+                        detectedDevices.forEach { dev ->
+                            Text(
+                                dev,
+                                fontSize = 12.sp,
+                                fontFamily = FontFamily.Monospace,
+                                color = Color(0xFFE0E0E0)
+                            )
+                        }
                     }
                 }
             }
