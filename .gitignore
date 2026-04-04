@@ -8,3 +8,5 @@
 /captures
 .externalNativeBuild
 .cxx
+node_modules
+cli/node_modules
