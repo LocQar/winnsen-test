@@ -5,6 +5,7 @@ import android.util.Log
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
 import com.locqar.winnsentest.hardware.HardwareSerial
+import com.locqar.winnsentest.hardware.ModbusRTU
 import com.locqar.winnsentest.hardware.WinnsenCodec
 import kotlinx.coroutines.*
 import kotlinx.coroutines.flow.MutableStateFlow
@@ -21,11 +22,15 @@ class TestViewModel(app: Application) : AndroidViewModel(app) {
     // Use hardware UART serial (not USB)
     val hwSerial = HardwareSerial()
 
-    // Config
+    // Config — LD1.0 APK uses /dev/ttyS1 at 9600,8,N,1
     val station = MutableStateFlow(1)
     val lockNumber = MutableStateFlow(1)
     val baudRate = MutableStateFlow(9600)
     val baudRates = listOf(9600, 19200, 38400, 57600, 115200, 4800, 2400)
+
+    // Protocol mode
+    enum class ProtocolMode { WINNSEN, MODBUS_RTU }
+    val protocolMode = MutableStateFlow(ProtocolMode.WINNSEN)
 
     // Door states
     private val _doorStates = MutableStateFlow<Map<Int, Boolean>>(emptyMap())
@@ -97,6 +102,100 @@ class TestViewModel(app: Application) : AndroidViewModel(app) {
         if (currentPort != null) {
             // Reconnect with new baud rate
             connectToPort(currentPort)
+        }
+    }
+
+    /**
+     * Quick connect: use the known LD1.0 APK config — /dev/ttyS1 @ 9600 baud.
+     * Then immediately try both Winnsen protocol and Modbus RTU.
+     */
+    fun quickConnect() {
+        viewModelScope.launch(Dispatchers.IO) {
+            val path = "/dev/ttyS1"
+            val baud = 9600
+            baudRate.value = baud
+
+            addLog("SYS", "--", "Quick connect: $path @ $baud (from LD1.0 APK config)")
+            hwSerial.disconnect()
+            hwSerial.connect(path, baud)
+
+            if (!hwSerial.isConnected) {
+                addLog("ERR", "--", "Failed to open $path: ${hwSerial.errorMessage.value}")
+                return@launch
+            }
+
+            val jniOk = hwSerial.baudRateSet.value
+            addLog("OK", "--", "Connected to $path (JNI baud set: $jniOk)")
+
+            // Test 1: Winnsen protocol poll
+            addLog("SYS", "--", "--- Testing Winnsen protocol ---")
+            for (st in listOf(1, 0)) {
+                val txFrame = WinnsenCodec.buildPollCommand(st)
+                addLog("TX", WinnsenCodec.toHex(txFrame), "Winnsen Poll station=$st")
+                val rxData = hwSerial.sendAndReceive(txFrame, WinnsenCodec.POLL_RESPONSE_LEN)
+                if (rxData != null) {
+                    addLog("RX", WinnsenCodec.toHex(rxData), "Got response!")
+                    val resp = WinnsenCodec.parsePollResponse(rxData)
+                    if (resp != null) {
+                        addLog("OK", "--", "Winnsen protocol WORKS! station=${resp.station}")
+                        station.value = resp.station
+                        _doorStates.value = resp.doorStates
+                        _lastResult.value = "WINNSEN OK: $path"
+                        protocolMode.value = ProtocolMode.WINNSEN
+                        return@launch
+                    } else {
+                        addLog("SYS", "--", "Got data but invalid Winnsen response")
+                    }
+                } else {
+                    addLog("RX", "--", "TIMEOUT")
+                }
+            }
+
+            // Test 2: Modbus RTU — read holding register 0 from slave 1
+            addLog("SYS", "--", "--- Testing Modbus RTU ---")
+            for (slaveAddr in listOf(1, 0, 2)) {
+                val modbusFrame = ModbusRTU.buildReadHoldingRegisters(slaveAddr, 0, 1)
+                addLog("TX", WinnsenCodec.toHex(modbusFrame), "Modbus RTU ReadHR slave=$slaveAddr reg=0")
+                val rxData = hwSerial.sendAndReceive(modbusFrame, 7) // min response: addr+func+count+2data+2crc
+                if (rxData != null) {
+                    addLog("RX", WinnsenCodec.toHex(rxData), "Got Modbus response!")
+                    _lastResult.value = "MODBUS OK: slave=$slaveAddr"
+                    protocolMode.value = ProtocolMode.MODBUS_RTU
+                    station.value = slaveAddr
+                    return@launch
+                } else {
+                    addLog("RX", "--", "TIMEOUT")
+                }
+            }
+
+            // Test 3: Modbus RTU — read coils (used by RTULockerCtrl for door state)
+            addLog("SYS", "--", "--- Testing Modbus RTU Read Coils ---")
+            for (slaveAddr in listOf(1, 0, 2)) {
+                val modbusFrame = ModbusRTU.buildReadCoils(slaveAddr, 0, 16)
+                addLog("TX", WinnsenCodec.toHex(modbusFrame), "Modbus ReadCoils slave=$slaveAddr")
+                val rxData = hwSerial.sendAndReceive(modbusFrame, 6) // addr+func+count+2data+2crc... actually min 7
+                if (rxData != null) {
+                    addLog("RX", WinnsenCodec.toHex(rxData), "Got Modbus coil response!")
+                    _lastResult.value = "MODBUS COILS OK: slave=$slaveAddr"
+                    protocolMode.value = ProtocolMode.MODBUS_RTU
+                    station.value = slaveAddr
+                    return@launch
+                } else {
+                    addLog("RX", "--", "TIMEOUT")
+                }
+            }
+
+            // Test 4: Raw read — see if anything is on the wire
+            addLog("SYS", "--", "--- Raw read test ---")
+            val rawBuf = ByteArray(64)
+            val n = hwSerial.rawRead(rawBuf, 2000)
+            if (n > 0) {
+                addLog("RX", WinnsenCodec.toHex(rawBuf.copyOf(n)), "RAW: $n bytes (unsolicited data)")
+                _lastResult.value = "RAW DATA: $n bytes"
+            } else {
+                addLog("SYS", "--", "No data on wire")
+                _lastResult.value = "NO RESPONSE on ttyS1"
+            }
         }
     }
 

@@ -129,13 +129,18 @@ fun TabletTestScreen(vm: TestViewModel = viewModel()) {
 
             Spacer(Modifier.height(10.dp))
 
-            // Auto-detect + Scan buttons
+            // Quick Connect + Auto-detect + Scan buttons
             Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                Button(
+                    onClick = { vm.quickConnect() },
+                    modifier = Modifier.height(44.dp),
+                    colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF4CAF50))
+                ) { Text("Quick Connect", fontSize = 14.sp, fontWeight = FontWeight.Bold) }
                 Button(
                     onClick = { vm.autoDetect() },
                     modifier = Modifier.height(44.dp),
                     colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF2196F3))
-                ) { Text("Auto-Detect", fontSize = 14.sp, fontWeight = FontWeight.Bold) }
+                ) { Text("Auto-Detect", fontSize = 14.sp) }
                 OutlinedButton(
                     onClick = { vm.scanPorts() },
                     modifier = Modifier.height(44.dp)
@@ -225,7 +230,7 @@ fun TabletTestScreen(vm: TestViewModel = viewModel()) {
             Row(horizontalArrangement = Arrangement.spacedBy(12.dp), modifier = Modifier.fillMaxWidth()) {
                 OutlinedTextField(
                     value = station.toString(),
-                    onValueChange = { it.toIntOrNull()?.let { v -> vm.station.value = v.coerceIn(1, 255) } },
+                    onValueChange = { it.toIntOrNull()?.let { v -> vm.station.value = v.coerceIn(0, 255) } },
                     label = { Text("Station #", fontSize = 14.sp) },
                     keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number),
                     modifier = Modifier.weight(1f),
