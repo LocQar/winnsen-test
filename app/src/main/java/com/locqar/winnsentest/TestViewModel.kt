@@ -24,6 +24,8 @@ class TestViewModel(app: Application) : AndroidViewModel(app) {
     // Config
     val station = MutableStateFlow(1)
     val lockNumber = MutableStateFlow(1)
+    val baudRate = MutableStateFlow(9600)
+    val baudRates = listOf(9600, 19200, 38400, 57600, 115200, 4800, 2400)
 
     // Door states
     private val _doorStates = MutableStateFlow<Map<Int, Boolean>>(emptyMap())
@@ -74,14 +76,79 @@ class TestViewModel(app: Application) : AndroidViewModel(app) {
     fun connectToPort(path: String) {
         stopAutoPolling()
         hwSerial.disconnect()
-        addLog("SYS", "--", "Connecting to $path...")
-        hwSerial.connect(path)
+        val baud = baudRate.value
+        addLog("SYS", "--", "Connecting to $path @ ${baud} baud...")
+        hwSerial.connect(path, baud)
 
         val state = hwSerial.connectionState.value
         if (state == HardwareSerial.ConnectionState.CONNECTED) {
+            val baudOk = hwSerial.baudRateSet.value
+            val tools = hwSerial.sttyTools.value
             addLog("OK", "--", "Connected to $path")
+            addLog("SYS", "--", "Baud rate set: $baudOk, tools: ${tools.ifEmpty { listOf("none found") }}")
         } else {
             addLog("ERR", "--", "Failed: ${hwSerial.errorMessage.value}")
+        }
+    }
+
+    fun changeBaudRate(baud: Int) {
+        baudRate.value = baud
+        val currentPort = hwSerial.connectedPort.value
+        if (currentPort != null) {
+            // Reconnect with new baud rate
+            connectToPort(currentPort)
+        }
+    }
+
+    /**
+     * Auto-detect: try all ports at all baud rates, send a poll command,
+     * and see which one responds.
+     */
+    fun autoDetect() {
+        viewModelScope.launch(Dispatchers.IO) {
+            addLog("SYS", "--", "Auto-detecting locker port...")
+            val ports = hwSerial.scanPorts().filter { it.readable && it.writable }
+
+            if (ports.isEmpty()) {
+                addLog("ERR", "--", "No accessible ports found")
+                return@launch
+            }
+
+            for (baud in baudRates) {
+                for (port in ports) {
+                    addLog("SYS", "--", "Trying ${port.path} @ $baud...")
+                    hwSerial.disconnect()
+                    hwSerial.connect(port.path, baud)
+
+                    if (!hwSerial.isConnected) continue
+
+                    // Try polling station 1
+                    val txFrame = WinnsenCodec.buildPollCommand(1)
+                    addLog("TX", WinnsenCodec.toHex(txFrame), "Poll station=1")
+
+                    val rxData = hwSerial.sendAndReceive(txFrame, WinnsenCodec.POLL_RESPONSE_LEN)
+
+                    if (rxData != null) {
+                        addLog("RX", WinnsenCodec.toHex(rxData), "")
+                        val resp = WinnsenCodec.parsePollResponse(rxData)
+                        if (resp != null) {
+                            addLog("OK", "--", "FOUND! ${port.path} @ $baud baud, station=${resp.station}")
+                            baudRate.value = baud
+                            station.value = resp.station
+                            _doorStates.value = resp.doorStates
+                            _lastResult.value = "DETECTED: ${port.path} @ $baud"
+                            return@launch
+                        } else {
+                            addLog("SYS", "--", "Got data but invalid Winnsen response")
+                        }
+                    }
+
+                    hwSerial.disconnect()
+                }
+            }
+
+            addLog("ERR", "--", "Auto-detect failed — no port responded")
+            _lastResult.value = "NOT FOUND"
         }
     }
 

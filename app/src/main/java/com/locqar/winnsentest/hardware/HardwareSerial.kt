@@ -115,12 +115,21 @@ class HardwareSerial {
         return results
     }
 
+    private val _baudRate = MutableStateFlow(9600)
+    val baudRate = _baudRate.asStateFlow()
+
+    private val _baudRateSet = MutableStateFlow(false)
+    val baudRateSet = _baudRateSet.asStateFlow()
+
+    private val _sttyTools = MutableStateFlow<List<String>>(emptyList())
+    val sttyTools = _sttyTools.asStateFlow()
+
     /**
-     * Connect to a specific serial port.
-     * Attempts to set baud rate to 9600 via stty command.
+     * Connect to a specific serial port with the given baud rate.
      */
-    fun connect(path: String) {
+    fun connect(path: String, baud: Int = 9600) {
         disconnect()
+        _baudRate.value = baud
 
         val file = File(path)
         if (!file.exists()) {
@@ -130,21 +139,13 @@ class HardwareSerial {
         }
 
         try {
-            // Try to set baud rate using stty (works on many Android devices)
-            try {
-                val process = Runtime.getRuntime().exec(arrayOf("stty", "-F", path, "9600", "raw", "-echo"))
-                process.waitFor()
-                Log.i(TAG, "stty set baud rate to 9600 on $path")
-            } catch (e: Exception) {
-                Log.w(TAG, "stty failed (may be OK): ${e.message}")
-                // Try alternative: busybox stty
-                try {
-                    val process = Runtime.getRuntime().exec(arrayOf("busybox", "stty", "-F", path, "9600", "raw"))
-                    process.waitFor()
-                } catch (e2: Exception) {
-                    Log.w(TAG, "busybox stty also failed: ${e2.message}")
-                }
-            }
+            // Find available stty tools
+            _sttyTools.value = NativeSerial.findAvailableTools()
+            Log.i(TAG, "Available tools: ${_sttyTools.value}")
+
+            // Try to set baud rate
+            _baudRateSet.value = NativeSerial.configureBaudRate(path, baud)
+            Log.i(TAG, "Baud rate configured: ${_baudRateSet.value}")
 
             // Open the device file for read/write
             outputStream = FileOutputStream(file)

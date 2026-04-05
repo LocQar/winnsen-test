@@ -129,14 +129,36 @@ fun TabletTestScreen(vm: TestViewModel = viewModel()) {
 
             Spacer(Modifier.height(10.dp))
 
-            // Scan + Port buttons
-            Row(verticalAlignment = Alignment.CenterVertically) {
+            // Auto-detect + Scan buttons
+            Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                 Button(
+                    onClick = { vm.autoDetect() },
+                    modifier = Modifier.height(44.dp),
+                    colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF2196F3))
+                ) { Text("Auto-Detect", fontSize = 14.sp, fontWeight = FontWeight.Bold) }
+                OutlinedButton(
                     onClick = { vm.scanPorts() },
-                    modifier = Modifier.height(40.dp)
-                ) { Text("Scan Ports", fontSize = 13.sp) }
-                Spacer(Modifier.width(8.dp))
-                Text("${availablePorts.size} ports found", fontSize = 13.sp, color = Color(0xFF888888))
+                    modifier = Modifier.height(44.dp)
+                ) { Text("Scan", fontSize = 13.sp) }
+                Text("${availablePorts.size} ports", fontSize = 12.sp, color = Color(0xFF888888))
+            }
+
+            // Baud rate selector
+            Spacer(Modifier.height(6.dp))
+            val currentBaud by vm.baudRate.collectAsStateWithLifecycle()
+            Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(4.dp)) {
+                Text("Baud:", fontSize = 12.sp, color = Color(0xFF888888))
+                vm.baudRates.forEach { baud ->
+                    val isSelected = baud == currentBaud
+                    OutlinedButton(
+                        onClick = { vm.changeBaudRate(baud) },
+                        modifier = Modifier.height(32.dp),
+                        contentPadding = PaddingValues(horizontal = 8.dp, vertical = 0.dp),
+                        colors = ButtonDefaults.outlinedButtonColors(
+                            contentColor = if (isSelected) Color(0xFF4CAF50) else Color(0xFF888888)
+                        )
+                    ) { Text("$baud", fontSize = 11.sp) }
+                }
             }
 
             // Available ports — scrollable row of buttons
