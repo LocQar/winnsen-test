@@ -87,12 +87,48 @@ class TestViewModel(app: Application) : AndroidViewModel(app) {
 
         val state = hwSerial.connectionState.value
         if (state == HardwareSerial.ConnectionState.CONNECTED) {
-            val baudOk = hwSerial.baudRateSet.value
-            val tools = hwSerial.sttyTools.value
-            addLog("OK", "--", "Connected to $path")
-            addLog("SYS", "--", "Baud rate set: $baudOk, tools: ${tools.ifEmpty { listOf("none found") }}")
+            addLog("OK", "--", "Connected: ${hwSerial.connectMethod.value}")
+            // Show all diagnostics
+            for (diag in hwSerial.diagnostics.value) {
+                addLog("DIAG", "--", diag)
+            }
         } else {
             addLog("ERR", "--", "Failed: ${hwSerial.errorMessage.value}")
+            for (diag in hwSerial.diagnostics.value) {
+                addLog("DIAG", "--", diag)
+            }
+        }
+    }
+
+    /**
+     * Send raw hex bytes and show response.
+     * Input format: "90 06 05 01 01 03"
+     */
+    fun sendRawHex(hexString: String) {
+        viewModelScope.launch(Dispatchers.IO) {
+            try {
+                val bytes = hexString.trim().split("\\s+".toRegex())
+                    .map { it.toInt(16).toByte() }
+                    .toByteArray()
+
+                addLog("TX", WinnsenCodec.toHex(bytes), "RAW ${bytes.size} bytes")
+
+                val os = hwSerial.let {
+                    if (!it.isConnected) {
+                        addLog("ERR", "--", "Not connected")
+                        return@launch
+                    }
+                }
+
+                val rxData = hwSerial.sendAndReceive(bytes, 32) // read up to 32 bytes
+                if (rxData != null) {
+                    addLog("RX", WinnsenCodec.toHex(rxData), "Got ${rxData.size} bytes!")
+                } else {
+                    addLog("RX", "--", "TIMEOUT")
+                }
+            } catch (e: Exception) {
+                addLog("ERR", "--", "Bad hex input: ${e.message}")
+            }
         }
     }
 
@@ -124,8 +160,11 @@ class TestViewModel(app: Application) : AndroidViewModel(app) {
                 return@launch
             }
 
-            val jniOk = hwSerial.baudRateSet.value
-            addLog("OK", "--", "Connected to $path (JNI baud set: $jniOk)")
+            addLog("OK", "--", "Connected: ${hwSerial.connectMethod.value}")
+            // Show all diagnostics
+            for (diag in hwSerial.diagnostics.value) {
+                addLog("DIAG", "--", diag)
+            }
 
             // Test 1: Winnsen protocol poll
             addLog("SYS", "--", "--- Testing Winnsen protocol ---")

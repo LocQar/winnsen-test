@@ -126,6 +126,18 @@ class HardwareSerial {
     private val _sttyTools = MutableStateFlow<List<String>>(emptyList())
     val sttyTools = _sttyTools.asStateFlow()
 
+    // Diagnostic info for UI
+    private val _connectMethod = MutableStateFlow("none")
+    val connectMethod = _connectMethod.asStateFlow()
+
+    private val _diagnostics = MutableStateFlow<List<String>>(emptyList())
+    val diagnostics = _diagnostics.asStateFlow()
+
+    private fun addDiag(msg: String) {
+        Log.i(TAG, "DIAG: $msg")
+        _diagnostics.value = _diagnostics.value + msg
+    }
+
     /**
      * Connect to a specific serial port with the given baud rate.
      * Uses JNI native termios for proper baud rate configuration.
@@ -133,68 +145,142 @@ class HardwareSerial {
     fun connect(path: String, baud: Int = 9600) {
         disconnect()
         _baudRate.value = baud
+        _diagnostics.value = emptyList()
 
         val file = File(path)
         if (!file.exists()) {
             _connectionState.value = ConnectionState.ERROR
             _errorMessage.value = "$path does not exist"
+            addDiag("ERROR: $path does not exist")
             return
         }
 
+        // Check if another process has the port open
         try {
-            // Method 1: JNI native open with termios (preferred)
+            val lsofResult = Runtime.getRuntime().exec(arrayOf("ls", "-la", path)).inputStream.bufferedReader().readText()
+            addDiag("ls -la: $lsofResult")
+        } catch (e: Exception) {
+            addDiag("ls check failed: ${e.message}")
+        }
+
+        // Try to detect who has the port open
+        try {
+            val fuserResult = Runtime.getRuntime().exec(arrayOf("fuser", path)).let { proc ->
+                val out = proc.inputStream.bufferedReader().readText().trim()
+                val err = proc.errorStream.bufferedReader().readText().trim()
+                "$out $err".trim()
+            }
+            if (fuserResult.isNotEmpty()) {
+                addDiag("fuser $path: $fuserResult (OTHER PROCESS HAS PORT!)")
+            } else {
+                addDiag("fuser: no other process using $path")
+            }
+        } catch (e: Exception) {
+            addDiag("fuser not available: ${e.message}")
+        }
+
+        // Method 1: Try JNI native open with termios
+        var jniSuccess = false
+        try {
+            addDiag("Trying JNI nativeOpen($path, $baud)...")
             val fd = SerialPortJNI.nativeOpen(path, baud)
+            addDiag("JNI nativeOpen returned fd=$fd")
 
             if (fd >= 0) {
                 // Create FileDescriptor from native fd using reflection
                 val fileDescriptor: FileDescriptor = FileDescriptor()
-                val fdField = FileDescriptor::class.java.getDeclaredField("descriptor")
-                fdField.isAccessible = true
-                fdField.setInt(fileDescriptor, fd)
 
-                val fd_: FileDescriptor = fileDescriptor
-                inputStream = FileInputStream(fd_)
-                outputStream = FileOutputStream(fd_)
-                nativeFd = fd
-                _baudRateSet.value = true
+                // Try "descriptor" first (Android), then "fd" (standard Java)
+                var fieldSet = false
+                for (fieldName in listOf("descriptor", "fd")) {
+                    try {
+                        val fdField = FileDescriptor::class.java.getDeclaredField(fieldName)
+                        fdField.isAccessible = true
+                        fdField.setInt(fileDescriptor, fd)
+                        addDiag("FileDescriptor field '$fieldName' set to $fd")
+                        fieldSet = true
+                        break
+                    } catch (e: NoSuchFieldException) {
+                        addDiag("FileDescriptor has no field '$fieldName'")
+                    }
+                }
 
-                _connectionState.value = ConnectionState.CONNECTED
-                _connectedPort.value = path
-                _errorMessage.value = null
-                Log.i(TAG, "Connected via JNI to $path @ $baud baud (fd=$fd)")
+                if (!fieldSet) {
+                    // List all fields for debugging
+                    val fields = FileDescriptor::class.java.declaredFields.map { it.name }
+                    addDiag("FileDescriptor fields: $fields")
+                    addDiag("ERROR: Cannot set fd — falling back")
+                } else {
+                    val fd_: FileDescriptor = fileDescriptor
+                    inputStream = FileInputStream(fd_)
+                    outputStream = FileOutputStream(fd_)
+                    nativeFd = fd
+                    _baudRateSet.value = true
+                    _connectMethod.value = "JNI (fd=$fd)"
+                    jniSuccess = true
+
+                    _connectionState.value = ConnectionState.CONNECTED
+                    _connectedPort.value = path
+                    _errorMessage.value = null
+                    addDiag("SUCCESS: Connected via JNI to $path @ $baud baud")
+                }
             } else {
-                // Method 2: Fallback to Java file open + stty
-                Log.w(TAG, "JNI open failed, falling back to Java FileStream")
+                addDiag("JNI nativeOpen returned -1 (check logcat for native error)")
+            }
+        } catch (e: UnsatisfiedLinkError) {
+            addDiag("JNI FAILED: UnsatisfiedLinkError: ${e.message}")
+        } catch (e: Exception) {
+            addDiag("JNI FAILED: ${e.javaClass.simpleName}: ${e.message}")
+        } catch (e: Error) {
+            addDiag("JNI FAILED: ${e.javaClass.simpleName}: ${e.message}")
+        }
+
+        // Method 2: Fallback to Java file open
+        if (!jniSuccess) {
+            try {
+                addDiag("Falling back to Java FileStream...")
                 _sttyTools.value = NativeSerial.findAvailableTools()
+                addDiag("stty tools found: ${_sttyTools.value.ifEmpty { listOf("NONE") }}")
                 _baudRateSet.value = NativeSerial.configureBaudRate(path, baud)
+                addDiag("Baud rate configured via stty: ${_baudRateSet.value}")
 
                 outputStream = FileOutputStream(file)
                 inputStream = FileInputStream(file)
+                _connectMethod.value = "Java FileStream (stty baud=${_baudRateSet.value})"
 
                 _connectionState.value = ConnectionState.CONNECTED
                 _connectedPort.value = path
                 _errorMessage.value = null
-                Log.i(TAG, "Connected via Java to $path (baud set: ${_baudRateSet.value})")
+                addDiag("Connected via Java to $path")
+            } catch (e: Exception) {
+                _connectionState.value = ConnectionState.ERROR
+                _errorMessage.value = "Cannot open $path: ${e.message}"
+                _connectMethod.value = "FAILED"
+                addDiag("BOTH METHODS FAILED: ${e.message}")
             }
-
-        } catch (e: Exception) {
-            _connectionState.value = ConnectionState.ERROR
-            _errorMessage.value = "Cannot open $path: ${e.message}"
-            Log.e(TAG, "Failed to open $path", e)
         }
     }
 
     /**
      * Send data and wait for response.
+     * Returns received bytes, or null if nothing received at all.
+     * If partial data is received (less than expected), returns what we got.
      */
     fun sendAndReceive(txData: ByteArray, expectedResponseLen: Int): ByteArray? {
-        val os = outputStream ?: return null
-        val is_ = inputStream ?: return null
+        val os = outputStream ?: run {
+            Log.e(TAG, "outputStream is null!")
+            return null
+        }
+        val is_ = inputStream ?: run {
+            Log.e(TAG, "inputStream is null!")
+            return null
+        }
 
         return try {
             // Send
             os.write(txData)
             os.flush()
+            Log.i(TAG, "TX: ${txData.size} bytes sent")
 
             // Read with timeout
             val accumulated = mutableListOf<Byte>()
@@ -206,20 +292,25 @@ class HardwareSerial {
                     val bytesRead = is_.read(buffer, 0, minOf(buffer.size, is_.available()))
                     if (bytesRead > 0) {
                         for (i in 0 until bytesRead) accumulated.add(buffer[i])
+                        Log.i(TAG, "RX: read $bytesRead bytes (total: ${accumulated.size})")
                     }
                 } else {
                     Thread.sleep(10) // Small delay before checking again
                 }
             }
 
-            if (accumulated.size >= expectedResponseLen) {
-                accumulated.toByteArray().copyOfRange(0, expectedResponseLen)
-            } else {
-                Log.w(TAG, "Timeout: got ${accumulated.size}/$expectedResponseLen bytes")
+            if (accumulated.isEmpty()) {
+                Log.w(TAG, "Timeout: 0/$expectedResponseLen bytes — no data at all")
                 null
+            } else if (accumulated.size < expectedResponseLen) {
+                Log.w(TAG, "Partial: got ${accumulated.size}/$expectedResponseLen bytes")
+                // Return partial data so caller can see what came back
+                accumulated.toByteArray()
+            } else {
+                accumulated.toByteArray().copyOfRange(0, expectedResponseLen)
             }
         } catch (e: Exception) {
-            Log.e(TAG, "Serial I/O error", e)
+            Log.e(TAG, "Serial I/O error: ${e.javaClass.simpleName}: ${e.message}", e)
             null
         }
     }
