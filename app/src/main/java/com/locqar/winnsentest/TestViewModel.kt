@@ -22,6 +22,121 @@ class TestViewModel(app: Application) : AndroidViewModel(app) {
     // Use hardware UART serial (not USB)
     val hwSerial = HardwareSerial()
 
+    // PIN management
+    val pinManager = PinManager(app)
+
+    // App mode
+    enum class AppMode { ADMIN, USER }
+    private val _appMode = MutableStateFlow(AppMode.ADMIN)
+    val appMode = _appMode.asStateFlow()
+
+    // PIN entry state
+    private val _pinInput = MutableStateFlow("")
+    val pinInput = _pinInput.asStateFlow()
+
+    private val _pinResult = MutableStateFlow<String?>(null)
+    val pinResult = _pinResult.asStateFlow()
+
+    fun switchMode(mode: AppMode) {
+        _appMode.value = mode
+        _pinInput.value = ""
+        _pinResult.value = null
+    }
+
+    fun onPinDigit(digit: String) {
+        if (_pinInput.value.length < 6) {
+            _pinInput.value += digit
+        }
+    }
+
+    fun onPinBackspace() {
+        if (_pinInput.value.isNotEmpty()) {
+            _pinInput.value = _pinInput.value.dropLast(1)
+        }
+    }
+
+    fun onPinClear() {
+        _pinInput.value = ""
+        _pinResult.value = null
+    }
+
+    /**
+     * User submits PIN to open their locker.
+     */
+    fun submitPin() {
+        val pin = _pinInput.value
+        if (pin.length < 4) {
+            _pinResult.value = "PIN must be at least 4 digits"
+            return
+        }
+
+        val assignment = pinManager.validatePin(pin)
+        if (assignment == null) {
+            _pinResult.value = "Invalid PIN"
+            _pinInput.value = ""
+            return
+        }
+
+        // Open the assigned locker
+        viewModelScope.launch(Dispatchers.IO) {
+            val st = station.value
+            val lk = assignment.lockNumber
+
+            _pinResult.value = "Opening locker ${lk}..."
+            addLog("SYS", "--", "PIN $pin → Opening lock $lk")
+
+            val txFrame = WinnsenCodec.buildOpenCommand(st, lk)
+            addLog("TX", WinnsenCodec.toHex(txFrame), "Open station=$st lock=$lk")
+
+            val rxData = hwSerial.sendAndReceive(txFrame, WinnsenCodec.OPEN_RESPONSE_LEN)
+
+            if (rxData == null) {
+                _pinResult.value = "Failed to open — no response"
+                addLog("ERR", "--", "PIN open failed — TIMEOUT")
+                return@launch
+            }
+
+            addLog("RX", WinnsenCodec.toHex(rxData), "")
+            val resp = WinnsenCodec.parseOpenResponse(rxData)
+
+            if (resp != null && resp.success) {
+                pinManager.markPickedUp(pin)
+                _pinResult.value = "Locker ${lk} OPENED! Please collect your item."
+                _lastResult.value = "PIN OPENED: lock=$lk"
+                addLog("OK", "--", "PIN $pin → Door $lk OPENED")
+            } else {
+                _pinResult.value = "Failed to open locker ${lk}"
+                addLog("FAIL", "--", "PIN $pin → Door $lk FAILED")
+            }
+
+            // Clear PIN after a delay
+            delay(5000)
+            _pinInput.value = ""
+            _pinResult.value = null
+        }
+    }
+
+    /**
+     * Admin: generate a PIN for a locker.
+     */
+    fun generatePinForLock(lockNumber: Int): String? {
+        val pin = pinManager.generateAndAssign(lockNumber)
+        if (pin != null) {
+            addLog("SYS", "--", "Generated PIN $pin for lock $lockNumber")
+        } else {
+            addLog("ERR", "--", "Lock $lockNumber already has an active PIN")
+        }
+        return pin
+    }
+
+    /**
+     * Admin: remove a PIN.
+     */
+    fun removePin(pin: String) {
+        pinManager.removePin(pin)
+        addLog("SYS", "--", "Removed PIN $pin")
+    }
+
     // Config — LD1.0 APK uses /dev/ttyS1 at 9600,8,N,1
     // Board responded with station=2 (DIP switch setting)
     val station = MutableStateFlow(2)

@@ -5,6 +5,7 @@ import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
+import androidx.compose.foundation.clickable
 import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
@@ -23,6 +24,7 @@ import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.KeyboardType
+import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.lifecycle.viewmodel.compose.viewModel
@@ -38,12 +40,233 @@ class MainActivity : ComponentActivity() {
                     modifier = Modifier.fillMaxSize(),
                     color = MaterialTheme.colorScheme.background
                 ) {
-                    TabletTestScreen()
+                    val vm: TestViewModel = viewModel()
+                    val appMode by vm.appMode.collectAsStateWithLifecycle()
+
+                    when (appMode) {
+                        TestViewModel.AppMode.USER -> PinEntryScreen(vm)
+                        TestViewModel.AppMode.ADMIN -> TabletTestScreen(vm)
+                    }
                 }
             }
         }
     }
 }
+
+// ===== USER-FACING PIN ENTRY SCREEN =====
+@Composable
+fun PinEntryScreen(vm: TestViewModel) {
+    val pinInput by vm.pinInput.collectAsStateWithLifecycle()
+    val pinResult by vm.pinResult.collectAsStateWithLifecycle()
+    val connState by vm.hwSerial.connectionState.collectAsStateWithLifecycle()
+    val doorStates by vm.doorStates.collectAsStateWithLifecycle()
+    val isConnected = connState == HardwareSerial.ConnectionState.CONNECTED
+
+    // Auto-connect on entering user mode
+    LaunchedEffect(Unit) {
+        if (!vm.isConnected) vm.quickConnect()
+    }
+
+    Row(
+        modifier = Modifier.fillMaxSize().background(Color(0xFF0A0E1A)),
+        horizontalArrangement = Arrangement.Center
+    ) {
+        // ===== LEFT: Locker Status =====
+        Column(
+            modifier = Modifier.weight(0.4f).fillMaxHeight().padding(32.dp),
+            horizontalAlignment = Alignment.CenterHorizontally
+        ) {
+            Text(
+                "LocQar Smart Locker",
+                fontSize = 32.sp,
+                fontWeight = FontWeight.Bold,
+                color = Color(0xFF4CAF50)
+            )
+            Spacer(Modifier.height(8.dp))
+            Text(
+                if (isConnected) "System Online" else "Connecting...",
+                fontSize = 16.sp,
+                color = if (isConnected) Color(0xFF81C784) else Color(0xFFFF9800)
+            )
+
+            Spacer(Modifier.height(32.dp))
+
+            // Locker grid
+            Text("Locker Status", fontSize = 20.sp, fontWeight = FontWeight.Bold, color = Color.White)
+            Spacer(Modifier.height(12.dp))
+            Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                for (row in 0..3) {
+                    Row(horizontalArrangement = Arrangement.spacedBy(8.dp), modifier = Modifier.fillMaxWidth()) {
+                        for (col in 1..4) {
+                            val lockId = row * 4 + col
+                            val isOpen = doorStates[lockId] ?: false
+                            val hasPin = vm.pinManager.getActivePinForLock(lockId) != null
+                            Box(
+                                modifier = Modifier.weight(1f).aspectRatio(1.4f)
+                                    .clip(RoundedCornerShape(12.dp))
+                                    .background(
+                                        when {
+                                            doorStates.isEmpty() -> Color(0xFF333333)
+                                            isOpen -> Color(0xFFD32F2F)
+                                            hasPin -> Color(0xFF1565C0) // Blue = has package
+                                            else -> Color(0xFF2E7D32)   // Green = available
+                                        }
+                                    )
+                                    .border(2.dp, Color(0xFF444444), RoundedCornerShape(12.dp)),
+                                contentAlignment = Alignment.Center
+                            ) {
+                                Column(horizontalAlignment = Alignment.CenterHorizontally) {
+                                    Text("$lockId", fontWeight = FontWeight.Bold, fontSize = 24.sp, color = Color.White)
+                                    Text(
+                                        when {
+                                            doorStates.isEmpty() -> ""
+                                            isOpen -> "OPEN"
+                                            hasPin -> "IN USE"
+                                            else -> "EMPTY"
+                                        },
+                                        fontSize = 11.sp, color = Color.White.copy(0.85f)
+                                    )
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            Spacer(Modifier.weight(1f))
+
+            // Switch to admin mode (small button at bottom)
+            TextButton(
+                onClick = { vm.switchMode(TestViewModel.AppMode.ADMIN) }
+            ) {
+                Text("Admin Mode", fontSize = 12.sp, color = Color(0xFF555555))
+            }
+        }
+
+        // ===== RIGHT: PIN Keypad =====
+        Column(
+            modifier = Modifier.weight(0.5f).fillMaxHeight().padding(48.dp),
+            horizontalAlignment = Alignment.CenterHorizontally,
+            verticalArrangement = Arrangement.Center
+        ) {
+            Text(
+                "Enter Your PIN",
+                fontSize = 28.sp,
+                fontWeight = FontWeight.Bold,
+                color = Color.White
+            )
+            Text(
+                "to collect your package",
+                fontSize = 16.sp,
+                color = Color(0xFF888888)
+            )
+
+            Spacer(Modifier.height(32.dp))
+
+            // PIN display (dots)
+            Row(
+                horizontalArrangement = Arrangement.spacedBy(16.dp),
+                modifier = Modifier.padding(vertical = 16.dp)
+            ) {
+                for (i in 0 until 6) {
+                    Box(
+                        modifier = Modifier
+                            .size(24.dp)
+                            .clip(CircleShape)
+                            .background(
+                                if (i < pinInput.length) Color(0xFF4CAF50) else Color(0xFF333333)
+                            )
+                            .border(2.dp, Color(0xFF555555), CircleShape)
+                    )
+                }
+            }
+
+            // Result message
+            if (pinResult != null) {
+                Spacer(Modifier.height(8.dp))
+                Text(
+                    pinResult!!,
+                    fontSize = 18.sp,
+                    fontWeight = FontWeight.Bold,
+                    color = when {
+                        pinResult!!.contains("OPENED") || pinResult!!.contains("collect") -> Color(0xFF4CAF50)
+                        pinResult!!.contains("Invalid") || pinResult!!.contains("Failed") -> Color(0xFFF44336)
+                        else -> Color(0xFFFF9800)
+                    },
+                    textAlign = TextAlign.Center,
+                    modifier = Modifier.fillMaxWidth()
+                )
+            }
+
+            Spacer(Modifier.height(24.dp))
+
+            // Numeric keypad
+            val keys = listOf(
+                listOf("1", "2", "3"),
+                listOf("4", "5", "6"),
+                listOf("7", "8", "9"),
+                listOf("C", "0", "<")
+            )
+
+            Column(verticalArrangement = Arrangement.spacedBy(12.dp)) {
+                for (keyRow in keys) {
+                    Row(
+                        horizontalArrangement = Arrangement.spacedBy(12.dp),
+                        modifier = Modifier.fillMaxWidth()
+                    ) {
+                        for (key in keyRow) {
+                            Button(
+                                onClick = {
+                                    when (key) {
+                                        "C" -> vm.onPinClear()
+                                        "<" -> vm.onPinBackspace()
+                                        else -> vm.onPinDigit(key)
+                                    }
+                                },
+                                modifier = Modifier.weight(1f).height(72.dp),
+                                shape = RoundedCornerShape(16.dp),
+                                colors = ButtonDefaults.buttonColors(
+                                    containerColor = when (key) {
+                                        "C" -> Color(0xFF424242)
+                                        "<" -> Color(0xFF424242)
+                                        else -> Color(0xFF1E1E2E)
+                                    }
+                                )
+                            ) {
+                                Text(
+                                    when (key) {
+                                        "<" -> "\u232B"  // backspace symbol
+                                        else -> key
+                                    },
+                                    fontSize = 28.sp,
+                                    fontWeight = FontWeight.Bold,
+                                    color = Color.White
+                                )
+                            }
+                        }
+                    }
+                }
+            }
+
+            Spacer(Modifier.height(20.dp))
+
+            // Submit button
+            Button(
+                onClick = { vm.submitPin() },
+                enabled = pinInput.length >= 4 && isConnected,
+                modifier = Modifier.fillMaxWidth().height(64.dp),
+                shape = RoundedCornerShape(16.dp),
+                colors = ButtonDefaults.buttonColors(
+                    containerColor = Color(0xFF4CAF50)
+                )
+            ) {
+                Text("OPEN LOCKER", fontSize = 22.sp, fontWeight = FontWeight.Bold)
+            }
+        }
+    }
+}
+
+// ===== ADMIN SCREEN (existing debug + PIN management) =====
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
@@ -83,7 +306,18 @@ fun TabletTestScreen(vm: TestViewModel = viewModel()) {
                 fontWeight = FontWeight.Bold,
                 color = MaterialTheme.colorScheme.primary
             )
-            Text("Hardware UART Mode", fontSize = 14.sp, color = Color(0xFFFFB74D))
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.SpaceBetween,
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                Text("Hardware UART Mode", fontSize = 14.sp, color = Color(0xFFFFB74D))
+                Button(
+                    onClick = { vm.switchMode(TestViewModel.AppMode.USER) },
+                    colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF1565C0)),
+                    modifier = Modifier.height(36.dp)
+                ) { Text("User Mode", fontSize = 12.sp) }
+            }
 
             Spacer(Modifier.height(12.dp))
 
@@ -307,8 +541,12 @@ fun TabletTestScreen(vm: TestViewModel = viewModel()) {
 
             Spacer(Modifier.height(16.dp))
 
-            // Door grid
-            Text("Door Status", fontSize = 18.sp, fontWeight = FontWeight.Bold, color = MaterialTheme.colorScheme.onSurface)
+            // Door grid with PIN management
+            val pinAssignments by vm.pinManager.assignments.collectAsStateWithLifecycle()
+            var showPinDialog by remember { mutableStateOf<Int?>(null) }
+            var generatedPin by remember { mutableStateOf<String?>(null) }
+
+            Text("Door Status (tap to assign PIN)", fontSize = 16.sp, fontWeight = FontWeight.Bold, color = MaterialTheme.colorScheme.onSurface)
             Spacer(Modifier.height(6.dp))
             Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
                 for (row in 0..3) {
@@ -316,26 +554,88 @@ fun TabletTestScreen(vm: TestViewModel = viewModel()) {
                         for (col in 1..4) {
                             val lockId = row * 4 + col
                             val isOpen = doorStates[lockId] ?: false
+                            val activePin = pinAssignments.values.find {
+                                it.lockNumber == lockId && it.status == PinManager.AssignmentStatus.ACTIVE
+                            }
                             Box(
                                 modifier = Modifier.weight(1f).aspectRatio(1.6f)
                                     .clip(RoundedCornerShape(10.dp))
                                     .background(
-                                        if (doorStates.isEmpty()) Color(0xFF333333)
-                                        else if (isOpen) Color(0xFFD32F2F) else Color(0xFF2E7D32)
+                                        when {
+                                            doorStates.isEmpty() -> Color(0xFF333333)
+                                            isOpen -> Color(0xFFD32F2F)
+                                            activePin != null -> Color(0xFF1565C0)
+                                            else -> Color(0xFF2E7D32)
+                                        }
                                     )
-                                    .border(2.dp, Color(0xFF555555), RoundedCornerShape(10.dp)),
+                                    .border(2.dp, Color(0xFF555555), RoundedCornerShape(10.dp))
+                                    .clickable { showPinDialog = lockId },
                                 contentAlignment = Alignment.Center
                             ) {
                                 Column(horizontalAlignment = Alignment.CenterHorizontally) {
-                                    Text("$lockId", fontWeight = FontWeight.Bold, fontSize = 22.sp, color = Color.White)
-                                    if (doorStates.isNotEmpty()) {
-                                        Text(if (isOpen) "OPEN" else "CLOSED", fontSize = 11.sp, color = Color.White.copy(0.9f))
+                                    Text("$lockId", fontWeight = FontWeight.Bold, fontSize = 20.sp, color = Color.White)
+                                    if (activePin != null) {
+                                        Text("PIN: ${activePin.pin}", fontSize = 10.sp, color = Color(0xFFBBDEFB))
+                                    } else if (doorStates.isNotEmpty()) {
+                                        Text(if (isOpen) "OPEN" else "CLOSED", fontSize = 10.sp, color = Color.White.copy(0.9f))
                                     }
                                 }
                             }
                         }
                     }
                 }
+            }
+
+            // PIN Dialog
+            if (showPinDialog != null) {
+                val lockId = showPinDialog!!
+                val existingPin = pinAssignments.values.find {
+                    it.lockNumber == lockId && it.status == PinManager.AssignmentStatus.ACTIVE
+                }
+
+                AlertDialog(
+                    onDismissRequest = { showPinDialog = null; generatedPin = null },
+                    title = { Text("Locker $lockId") },
+                    text = {
+                        Column {
+                            if (existingPin != null) {
+                                Text("Active PIN: ${existingPin.pin}", fontSize = 20.sp, fontWeight = FontWeight.Bold, color = Color(0xFF4CAF50))
+                                Spacer(Modifier.height(8.dp))
+                                Text("Status: ${existingPin.status}", fontSize = 14.sp)
+                            } else if (generatedPin != null) {
+                                Text("PIN Generated!", fontSize = 16.sp, color = Color(0xFF4CAF50))
+                                Spacer(Modifier.height(8.dp))
+                                Text(generatedPin!!, fontSize = 36.sp, fontWeight = FontWeight.Bold, color = Color.White,
+                                    fontFamily = FontFamily.Monospace)
+                                Spacer(Modifier.height(8.dp))
+                                Text("Share this PIN with the customer", fontSize = 14.sp, color = Color(0xFF888888))
+                            } else {
+                                Text("No active PIN for this locker", fontSize = 14.sp)
+                            }
+                        }
+                    },
+                    confirmButton = {
+                        if (existingPin != null) {
+                            Button(
+                                onClick = {
+                                    vm.removePin(existingPin.pin)
+                                    showPinDialog = null
+                                    generatedPin = null
+                                },
+                                colors = ButtonDefaults.buttonColors(containerColor = Color(0xFFF44336))
+                            ) { Text("Remove PIN") }
+                        } else if (generatedPin == null) {
+                            Button(
+                                onClick = { generatedPin = vm.generatePinForLock(lockId) }
+                            ) { Text("Generate PIN") }
+                        }
+                    },
+                    dismissButton = {
+                        TextButton(onClick = { showPinDialog = null; generatedPin = null }) {
+                            Text("Close")
+                        }
+                    }
+                )
             }
         }
 
