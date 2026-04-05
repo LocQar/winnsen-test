@@ -4,7 +4,7 @@ import android.app.Application
 import android.util.Log
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
-import com.locqar.winnsentest.hardware.SerialManager
+import com.locqar.winnsentest.hardware.HardwareSerial
 import com.locqar.winnsentest.hardware.WinnsenCodec
 import kotlinx.coroutines.*
 import kotlinx.coroutines.flow.MutableStateFlow
@@ -18,19 +18,19 @@ class TestViewModel(app: Application) : AndroidViewModel(app) {
         private const val TAG = "TestVM"
     }
 
-    val serial = SerialManager(app.applicationContext)
+    // Use hardware UART serial (not USB)
+    val hwSerial = HardwareSerial()
 
     // Config
     val station = MutableStateFlow(1)
     val lockNumber = MutableStateFlow(1)
 
-    // Door states: lock number -> isOpen
+    // Door states
     private val _doorStates = MutableStateFlow<Map<Int, Boolean>>(emptyMap())
     val doorStates = _doorStates.asStateFlow()
 
-    // Hex log entries
+    // Log
     data class LogEntry(val timestamp: String, val direction: String, val hex: String, val note: String)
-
     private val _log = MutableStateFlow<List<LogEntry>>(emptyList())
     val log = _log.asStateFlow()
 
@@ -39,26 +39,55 @@ class TestViewModel(app: Application) : AndroidViewModel(app) {
     val autoPolling = _autoPolling.asStateFlow()
     private var pollJob: Job? = null
 
-    // Last action result
+    // Last result
     private val _lastResult = MutableStateFlow("")
     val lastResult = _lastResult.asStateFlow()
 
     private val timeFormat = SimpleDateFormat("HH:mm:ss.SSS", Locale.US)
 
-    fun connect() {
-        serial.connect()
-        addLog("SYS", "--", "Connecting to USB adapter...")
+    val isConnected: Boolean get() = hwSerial.isConnected
+
+    /**
+     * Scan for available hardware serial ports.
+     */
+    fun scanPorts() {
+        addLog("SYS", "--", "Scanning for serial ports...")
+        val ports = hwSerial.scanPorts()
+        if (ports.isEmpty()) {
+            addLog("SYS", "--", "No serial ports found in /dev/")
+        } else {
+            addLog("SYS", "--", "Found ${ports.size} serial ports:")
+            for (p in ports) {
+                val access = buildString {
+                    if (p.readable) append("R")
+                    if (p.writable) append("W")
+                    if (!p.readable && !p.writable) append("NO ACCESS")
+                }
+                addLog("SYS", "--", "  ${p.path} [$access]")
+            }
+        }
     }
 
-    fun switchInterface(ifaceIdx: Int) {
+    /**
+     * Connect to a specific serial port path.
+     */
+    fun connectToPort(path: String) {
         stopAutoPolling()
-        addLog("SYS", "--", "Switching to interface $ifaceIdx...")
-        serial.setInterfaceIndex(ifaceIdx)
+        hwSerial.disconnect()
+        addLog("SYS", "--", "Connecting to $path...")
+        hwSerial.connect(path)
+
+        val state = hwSerial.connectionState.value
+        if (state == HardwareSerial.ConnectionState.CONNECTED) {
+            addLog("OK", "--", "Connected to $path")
+        } else {
+            addLog("ERR", "--", "Failed: ${hwSerial.errorMessage.value}")
+        }
     }
 
     fun disconnect() {
         stopAutoPolling()
-        serial.disconnect()
+        hwSerial.disconnect()
         _doorStates.value = emptyMap()
         addLog("SYS", "--", "Disconnected")
     }
@@ -71,7 +100,7 @@ class TestViewModel(app: Application) : AndroidViewModel(app) {
                 val txFrame = WinnsenCodec.buildOpenCommand(st, lk)
                 addLog("TX", WinnsenCodec.toHex(txFrame), "Open station=$st lock=$lk")
 
-                val rxData = serial.sendAndReceive(txFrame, WinnsenCodec.OPEN_RESPONSE_LEN)
+                val rxData = hwSerial.sendAndReceive(txFrame, WinnsenCodec.OPEN_RESPONSE_LEN)
 
                 if (rxData == null) {
                     addLog("RX", "--", "TIMEOUT - no response")
@@ -101,9 +130,7 @@ class TestViewModel(app: Application) : AndroidViewModel(app) {
     }
 
     fun pollOnce() {
-        viewModelScope.launch(Dispatchers.IO) {
-            doPoll()
-        }
+        viewModelScope.launch(Dispatchers.IO) { doPoll() }
     }
 
     private suspend fun doPoll() {
@@ -112,7 +139,7 @@ class TestViewModel(app: Application) : AndroidViewModel(app) {
             val txFrame = WinnsenCodec.buildPollCommand(st)
             addLog("TX", WinnsenCodec.toHex(txFrame), "Poll station=$st")
 
-            val rxData = serial.sendAndReceive(txFrame, WinnsenCodec.POLL_RESPONSE_LEN)
+            val rxData = hwSerial.sendAndReceive(txFrame, WinnsenCodec.POLL_RESPONSE_LEN)
 
             if (rxData == null) {
                 addLog("RX", "--", "TIMEOUT")
@@ -132,39 +159,26 @@ class TestViewModel(app: Application) : AndroidViewModel(app) {
             }
         } catch (e: Exception) {
             addLog("ERR", "", "Poll error: ${e.message}")
-            Log.e(TAG, "poll error", e)
         }
     }
 
     fun toggleAutoPolling() {
-        if (_autoPolling.value) {
-            stopAutoPolling()
-        } else {
-            startAutoPolling()
-        }
+        if (_autoPolling.value) stopAutoPolling() else startAutoPolling()
     }
 
     private fun startAutoPolling() {
         _autoPolling.value = true
         pollJob = viewModelScope.launch(Dispatchers.IO) {
             addLog("SYS", "--", "Auto-poll started (1s interval)")
-            while (isActive) {
-                doPoll()
-                delay(1000)
-            }
+            while (isActive) { doPoll(); delay(1000) }
         }
     }
 
     private fun stopAutoPolling() {
-        pollJob?.cancel()
-        pollJob = null
-        _autoPolling.value = false
-        addLog("SYS", "--", "Auto-poll stopped")
+        pollJob?.cancel(); pollJob = null; _autoPolling.value = false
     }
 
-    fun clearLog() {
-        _log.value = emptyList()
-    }
+    fun clearLog() { _log.value = emptyList() }
 
     private fun addLog(direction: String, hex: String, note: String) {
         val entry = LogEntry(timeFormat.format(Date()), direction, hex, note)
@@ -172,7 +186,7 @@ class TestViewModel(app: Application) : AndroidViewModel(app) {
     }
 
     override fun onCleared() {
-        serial.destroy()
+        hwSerial.disconnect()
         super.onCleared()
     }
 }
