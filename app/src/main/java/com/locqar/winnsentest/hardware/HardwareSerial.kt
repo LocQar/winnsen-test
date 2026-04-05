@@ -4,6 +4,7 @@ import android.util.Log
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import java.io.File
+import java.io.FileDescriptor
 import java.io.FileInputStream
 import java.io.FileOutputStream
 import java.io.IOException
@@ -146,13 +147,14 @@ class HardwareSerial {
 
             if (fd >= 0) {
                 // Create FileDescriptor from native fd using reflection
-                val fileDescriptor = FileDescriptor()
+                val fileDescriptor: FileDescriptor = FileDescriptor()
                 val fdField = FileDescriptor::class.java.getDeclaredField("descriptor")
                 fdField.isAccessible = true
                 fdField.setInt(fileDescriptor, fd)
 
-                inputStream = FileInputStream(fileDescriptor)
-                outputStream = FileOutputStream(fileDescriptor)
+                val fd_: FileDescriptor = fileDescriptor
+                inputStream = FileInputStream(fd_)
+                outputStream = FileOutputStream(fd_)
                 nativeFd = fd
                 _baudRateSet.value = true
 
