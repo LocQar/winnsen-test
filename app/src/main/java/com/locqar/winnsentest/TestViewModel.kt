@@ -23,7 +23,8 @@ class TestViewModel(app: Application) : AndroidViewModel(app) {
     val hwSerial = HardwareSerial()
 
     // Config — LD1.0 APK uses /dev/ttyS1 at 9600,8,N,1
-    val station = MutableStateFlow(1)
+    // Board responded with station=2 (DIP switch setting)
+    val station = MutableStateFlow(2)
     val lockNumber = MutableStateFlow(1)
     val baudRate = MutableStateFlow(9600)
     val baudRates = listOf(9600, 19200, 38400, 57600, 115200, 4800, 2400)
@@ -167,8 +168,9 @@ class TestViewModel(app: Application) : AndroidViewModel(app) {
             }
 
             // Test 1: Winnsen protocol poll
+            // Station 0 = broadcast, board responded with station 2 previously
             addLog("SYS", "--", "--- Testing Winnsen protocol ---")
-            for (st in listOf(1, 0)) {
+            for (st in listOf(0, 1, 2, 3)) {
                 val txFrame = WinnsenCodec.buildPollCommand(st)
                 addLog("TX", WinnsenCodec.toHex(txFrame), "Winnsen Poll station=$st")
                 val rxData = hwSerial.sendAndReceive(txFrame, WinnsenCodec.POLL_RESPONSE_LEN)
@@ -269,7 +271,7 @@ class TestViewModel(app: Application) : AndroidViewModel(app) {
                 return@launch
             }
 
-            val stationsToTry = listOf(0, 1)
+            val stationsToTry = listOf(0, 1, 2, 3, 4, 5)
 
             for (baud in baudRates) {
                 for (port in ports) {

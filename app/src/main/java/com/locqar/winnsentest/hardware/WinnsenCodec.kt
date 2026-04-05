@@ -25,8 +25,11 @@ object WinnsenCodec {
     private const val FN_OPEN: Byte = 0x05
     private const val FN_POLL: Byte = 0x02
 
-    private const val FN_OPEN_RESP: Byte = 0x85.toByte()
-    private const val FN_POLL_RESP: Byte = 0x82.toByte()
+    // Response function codes — some boards use 0x80 offset, others use 0xA0 offset
+    private const val FN_OPEN_RESP_82: Byte = 0x85.toByte()   // documented
+    private const val FN_OPEN_RESP_A0: Byte = 0xA5.toByte()   // alternate (seen on some boards)
+    private const val FN_POLL_RESP_82: Byte = 0x82.toByte()    // documented
+    private const val FN_POLL_RESP_A0: Byte = 0xA2.toByte()    // alternate (confirmed on Godwin's board)
 
     const val OPEN_RESPONSE_LEN = 7
     const val POLL_RESPONSE_LEN = 7
@@ -70,7 +73,8 @@ object WinnsenCodec {
     fun parseOpenResponse(data: ByteArray): OpenResponse? {
         if (data.size < OPEN_RESPONSE_LEN) return null
         if (data[0] != FRAME_HEADER) return null
-        if (data[2] != FN_OPEN_RESP) return null
+        // Accept both 0x85 (documented) and 0xA5 (alternate) response codes
+        if (data[2] != FN_OPEN_RESP_82 && data[2] != FN_OPEN_RESP_A0) return null
         if (data[6] != FRAME_END) return null
         return OpenResponse(
             station = data[3].toInt() and 0xFF,
@@ -82,7 +86,8 @@ object WinnsenCodec {
     fun parsePollResponse(data: ByteArray): PollResponse? {
         if (data.size < POLL_RESPONSE_LEN) return null
         if (data[0] != FRAME_HEADER) return null
-        if (data[2] != FN_POLL_RESP) return null
+        // Accept both 0x82 (documented) and 0xA2 (alternate) response codes
+        if (data[2] != FN_POLL_RESP_82 && data[2] != FN_POLL_RESP_A0) return null
         if (data[6] != FRAME_END) return null
         val station = data[3].toInt() and 0xFF
         val lowState = data[4].toInt() and 0xFF
