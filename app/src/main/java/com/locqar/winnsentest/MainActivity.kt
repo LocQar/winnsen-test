@@ -226,11 +226,26 @@ fun TabletTestScreen(vm: TestViewModel = viewModel()) {
 
             Spacer(Modifier.height(12.dp))
 
-            // Config
+            // Config — use local text state so typing isn't blocked by validation
+            var stationText by remember { mutableStateOf(station.toString()) }
+            var lockText by remember { mutableStateOf(lockNum.toString()) }
+
+            // Sync when ViewModel updates externally (e.g. auto-detect)
+            LaunchedEffect(station) { stationText = station.toString() }
+            LaunchedEffect(lockNum) { lockText = lockNum.toString() }
+
             Row(horizontalArrangement = Arrangement.spacedBy(12.dp), modifier = Modifier.fillMaxWidth()) {
                 OutlinedTextField(
-                    value = station.toString(),
-                    onValueChange = { it.toIntOrNull()?.let { v -> vm.station.value = v.coerceIn(0, 255) } },
+                    value = stationText,
+                    onValueChange = { text ->
+                        // Allow empty field and any digits while typing
+                        if (text.isEmpty() || text.all { it.isDigit() }) {
+                            stationText = text
+                            text.toIntOrNull()?.let { v ->
+                                vm.station.value = v.coerceIn(0, 255)
+                            }
+                        }
+                    },
                     label = { Text("Station #", fontSize = 14.sp) },
                     keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number),
                     modifier = Modifier.weight(1f),
@@ -238,8 +253,15 @@ fun TabletTestScreen(vm: TestViewModel = viewModel()) {
                     textStyle = LocalTextStyle.current.copy(fontSize = 20.sp)
                 )
                 OutlinedTextField(
-                    value = lockNum.toString(),
-                    onValueChange = { it.toIntOrNull()?.let { v -> vm.lockNumber.value = v.coerceIn(1, 16) } },
+                    value = lockText,
+                    onValueChange = { text ->
+                        if (text.isEmpty() || text.all { it.isDigit() }) {
+                            lockText = text
+                            text.toIntOrNull()?.let { v ->
+                                vm.lockNumber.value = v.coerceIn(1, 16)
+                            }
+                        }
+                    },
                     label = { Text("Lock #", fontSize = 14.sp) },
                     keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number),
                     modifier = Modifier.weight(1f),
