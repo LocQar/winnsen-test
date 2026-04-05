@@ -22,9 +22,8 @@ android {
     }
 
     externalNativeBuild {
-        cmake {
-            path = file("src/main/jni/CMakeLists.txt")
-            version = "3.18.1"
+        ndkBuild {
+            path = file("src/main/jni/Android.mk")
         }
     }
 
