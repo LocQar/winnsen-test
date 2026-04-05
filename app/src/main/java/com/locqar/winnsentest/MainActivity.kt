@@ -50,6 +50,8 @@ fun TabletTestScreen(vm: TestViewModel = viewModel()) {
     val deviceName by vm.serial.connectedDeviceName.collectAsStateWithLifecycle()
     val errorMsg by vm.serial.errorMessage.collectAsStateWithLifecycle()
     val detectedDevices by vm.serial.detectedDevices.collectAsStateWithLifecycle()
+    val selectedIface by vm.serial.selectedInterface.collectAsStateWithLifecycle()
+    val totalIfaces by vm.serial.totalInterfaces.collectAsStateWithLifecycle()
     val doorStates by vm.doorStates.collectAsStateWithLifecycle()
     val logEntries by vm.log.collectAsStateWithLifecycle()
     val autoPolling by vm.autoPolling.collectAsStateWithLifecycle()
@@ -140,6 +142,31 @@ fun TabletTestScreen(vm: TestViewModel = viewModel()) {
                             if (isConnected) "Disconnect" else "Connect",
                             fontSize = 16.sp
                         )
+                    }
+                }
+            }
+
+            // Interface selector — try different interfaces on the Winnsen board
+            if (isConnected && totalIfaces > 1) {
+                Spacer(Modifier.height(8.dp))
+                Text(
+                    "USB Interface (current: $selectedIface)",
+                    fontSize = 14.sp,
+                    fontWeight = FontWeight.Bold,
+                    color = Color(0xFFFFB74D)
+                )
+                Spacer(Modifier.height(4.dp))
+                Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                    for (i in 0 until totalIfaces) {
+                        OutlinedButton(
+                            onClick = { vm.switchInterface(i) },
+                            modifier = Modifier.height(40.dp),
+                            colors = ButtonDefaults.outlinedButtonColors(
+                                contentColor = if (i == selectedIface) Color(0xFF4CAF50) else Color.White
+                            )
+                        ) {
+                            Text("iface $i", fontSize = 13.sp)
+                        }
                     }
                 }
             }

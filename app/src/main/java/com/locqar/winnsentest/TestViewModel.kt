@@ -50,6 +50,12 @@ class TestViewModel(app: Application) : AndroidViewModel(app) {
         addLog("SYS", "--", "Connecting to USB adapter...")
     }
 
+    fun switchInterface(ifaceIdx: Int) {
+        stopAutoPolling()
+        addLog("SYS", "--", "Switching to interface $ifaceIdx...")
+        serial.setInterfaceIndex(ifaceIdx)
+    }
+
     fun disconnect() {
         stopAutoPolling()
         serial.disconnect()

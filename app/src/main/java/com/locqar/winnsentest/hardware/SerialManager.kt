@@ -49,11 +49,20 @@ class SerialManager(private val context: Context) {
 
     val isConnected: Boolean get() = _connectionState.value == ConnectionState.CONNECTED
 
+    // Configurable interface index (-1 = auto-scan)
+    private val _selectedInterface = MutableStateFlow(-1)
+    val selectedInterface = _selectedInterface.asStateFlow()
+
+    // Total interfaces on the Winnsen device
+    private val _totalInterfaces = MutableStateFlow(0)
+    val totalInterfaces = _totalInterfaces.asStateFlow()
+
     // Raw USB handles for Winnsen board
     private var usbConnection: UsbDeviceConnection? = null
     private var usbInterface: UsbInterface? = null
     private var endpointIn: UsbEndpoint? = null
     private var endpointOut: UsbEndpoint? = null
+    private var winnsenDeviceRef: UsbDevice? = null
 
     // Also support standard serial library as fallback
     private var serialPort: com.hoho.android.usbserial.driver.UsbSerialPort? = null
@@ -183,15 +192,32 @@ class SerialManager(private val context: Context) {
     }
 
     /**
+     * Set which interface index to use, then reconnect.
+     */
+    fun setInterfaceIndex(index: Int) {
+        _selectedInterface.value = index
+        // If we have a device reference, reconnect on new interface
+        winnsenDeviceRef?.let { device ->
+            disconnect()
+            if (usbManager.hasPermission(device)) {
+                openWinnsenDevice(device)
+            }
+        }
+    }
+
+    /**
      * Open the Winnsen control board using raw USB bulk transfers.
-     * Scans all interfaces for bulk IN + OUT endpoint pairs.
+     * Uses selectedInterface if set, otherwise scans for first bulk pair.
      */
     private fun openWinnsenDevice(device: UsbDevice) {
+        winnsenDeviceRef = device
+        _totalInterfaces.value = device.interfaceCount
+
         try {
             val connection = usbManager.openDevice(device)
                 ?: throw IllegalStateException("Could not open USB device")
 
-            // Scan all interfaces for bulk endpoints
+            val targetIfaceIdx = _selectedInterface.value
             var foundInterface: UsbInterface? = null
             var foundIn: UsbEndpoint? = null
             var foundOut: UsbEndpoint? = null
@@ -214,18 +240,38 @@ class SerialManager(private val context: Context) {
                 triedInterfaces.add(status)
                 Log.i(TAG, status)
 
-                if (bulkIn != null && bulkOut != null && foundInterface == null) {
-                    foundInterface = iface
-                    foundIn = bulkIn
-                    foundOut = bulkOut
-                    Log.i(TAG, "Using interface $i for serial comms")
+                // If user selected a specific interface, use that one
+                if (targetIfaceIdx >= 0) {
+                    if (i == targetIfaceIdx && bulkIn != null && bulkOut != null) {
+                        foundInterface = iface
+                        foundIn = bulkIn
+                        foundOut = bulkOut
+                    } else if (i == targetIfaceIdx) {
+                        // Selected interface doesn't have bulk endpoints — try using ANY endpoints
+                        for (e in 0 until iface.endpointCount) {
+                            val ep = iface.getEndpoint(e)
+                            if (ep.direction == UsbConstants.USB_DIR_IN && foundIn == null) foundIn = ep
+                            if (ep.direction == UsbConstants.USB_DIR_OUT && foundOut == null) foundOut = ep
+                        }
+                        if (foundIn != null && foundOut != null) {
+                            foundInterface = iface
+                        }
+                    }
+                } else {
+                    // Auto-scan: use first interface with bulk IN+OUT
+                    if (bulkIn != null && bulkOut != null && foundInterface == null) {
+                        foundInterface = iface
+                        foundIn = bulkIn
+                        foundOut = bulkOut
+                        _selectedInterface.value = i
+                    }
                 }
             }
 
             if (foundInterface == null || foundIn == null || foundOut == null) {
                 connection.close()
                 val detail = triedInterfaces.joinToString("\n")
-                throw IllegalStateException("No bulk IN+OUT endpoint pair found.\n$detail")
+                throw IllegalStateException("No endpoints on iface $targetIfaceIdx.\n$detail")
             }
 
             // Claim the interface
