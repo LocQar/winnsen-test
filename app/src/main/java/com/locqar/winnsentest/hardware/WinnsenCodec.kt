@@ -32,7 +32,7 @@ object WinnsenCodec {
     const val POLL_RESPONSE_LEN = 7
 
     fun buildOpenCommand(station: Int, lock: Int): ByteArray {
-        require(station in 1..255) { "Station must be 1-255, got $station" }
+        require(station in 0..255) { "Station must be 0-255, got $station" }
         require(lock in 1..16) { "Lock must be 1-16, got $lock" }
         return byteArrayOf(
             FRAME_HEADER,
@@ -45,7 +45,7 @@ object WinnsenCodec {
     }
 
     fun buildPollCommand(station: Int, mask: Int = 0xFFFF): ByteArray {
-        require(station in 1..255) { "Station must be 1-255, got $station" }
+        require(station in 0..255) { "Station must be 0-255, got $station" }
         val lowMask = mask and 0xFF
         val highMask = (mask shr 8) and 0xFF
         return byteArrayOf(

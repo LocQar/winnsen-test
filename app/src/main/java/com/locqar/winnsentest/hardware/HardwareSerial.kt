@@ -224,6 +224,30 @@ class HardwareSerial {
         }
     }
 
+    /**
+     * Raw read: try to read any available bytes within timeout.
+     * Returns number of bytes actually read.
+     */
+    fun rawRead(buffer: ByteArray, timeoutMs: Int = 500): Int {
+        val is_ = inputStream ?: return 0
+        val deadline = System.currentTimeMillis() + timeoutMs
+        var totalRead = 0
+
+        try {
+            while (totalRead < buffer.size && System.currentTimeMillis() < deadline) {
+                if (is_.available() > 0) {
+                    val n = is_.read(buffer, totalRead, minOf(buffer.size - totalRead, is_.available()))
+                    if (n > 0) totalRead += n
+                } else {
+                    Thread.sleep(10)
+                }
+            }
+        } catch (e: Exception) {
+            Log.w(TAG, "rawRead error: ${e.message}")
+        }
+        return totalRead
+    }
+
     fun disconnect() {
         try { inputStream?.close() } catch (_: Exception) {}
         try { outputStream?.close() } catch (_: Exception) {}

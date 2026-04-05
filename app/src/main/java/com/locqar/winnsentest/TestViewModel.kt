@@ -100,55 +100,98 @@ class TestViewModel(app: Application) : AndroidViewModel(app) {
         }
     }
 
+    // Auto-detect state
+    private val _autoDetecting = MutableStateFlow(false)
+    val autoDetecting = _autoDetecting.asStateFlow()
+    private var autoDetectJob: Job? = null
+
     /**
-     * Auto-detect: try all ports at all baud rates, send a poll command,
-     * and see which one responds.
+     * Auto-detect: try all ports at all baud rates with stations 0 and 1,
+     * send a poll command, and see which one responds.
+     * Also does a raw read test to detect any data on each port.
      */
     fun autoDetect() {
-        viewModelScope.launch(Dispatchers.IO) {
+        if (_autoDetecting.value) {
+            // Cancel if already running
+            autoDetectJob?.cancel()
+            _autoDetecting.value = false
+            addLog("SYS", "--", "Auto-detect cancelled")
+            return
+        }
+
+        autoDetectJob = viewModelScope.launch(Dispatchers.IO) {
+            _autoDetecting.value = true
             addLog("SYS", "--", "Auto-detecting locker port...")
+            addLog("SYS", "--", "Will try stations 0 and 1 on each port/baud combo")
             val ports = hwSerial.scanPorts().filter { it.readable && it.writable }
 
             if (ports.isEmpty()) {
                 addLog("ERR", "--", "No accessible ports found")
+                _autoDetecting.value = false
                 return@launch
             }
 
+            val stationsToTry = listOf(0, 1)
+
             for (baud in baudRates) {
                 for (port in ports) {
+                    if (!isActive) { _autoDetecting.value = false; return@launch }
+
                     addLog("SYS", "--", "Trying ${port.path} @ $baud...")
                     hwSerial.disconnect()
                     hwSerial.connect(port.path, baud)
 
                     if (!hwSerial.isConnected) continue
 
-                    // Try polling station 1
-                    val txFrame = WinnsenCodec.buildPollCommand(1)
-                    addLog("TX", WinnsenCodec.toHex(txFrame), "Poll station=1")
+                    // Log JNI status
+                    val jniOk = hwSerial.baudRateSet.value
+                    if (!jniOk) {
+                        addLog("WARN", "--", "Baud rate NOT set (JNI may have failed)")
+                    }
 
-                    val rxData = hwSerial.sendAndReceive(txFrame, WinnsenCodec.POLL_RESPONSE_LEN)
+                    for (st in stationsToTry) {
+                        if (!isActive) { _autoDetecting.value = false; return@launch }
 
-                    if (rxData != null) {
-                        addLog("RX", WinnsenCodec.toHex(rxData), "")
-                        val resp = WinnsenCodec.parsePollResponse(rxData)
-                        if (resp != null) {
-                            addLog("OK", "--", "FOUND! ${port.path} @ $baud baud, station=${resp.station}")
-                            baudRate.value = baud
-                            station.value = resp.station
-                            _doorStates.value = resp.doorStates
-                            _lastResult.value = "DETECTED: ${port.path} @ $baud"
-                            return@launch
-                        } else {
-                            addLog("SYS", "--", "Got data but invalid Winnsen response")
+                        // Try polling this station
+                        val txFrame = WinnsenCodec.buildPollCommand(st)
+                        addLog("TX", WinnsenCodec.toHex(txFrame), "Poll station=$st")
+
+                        val rxData = hwSerial.sendAndReceive(txFrame, WinnsenCodec.POLL_RESPONSE_LEN)
+
+                        if (rxData != null) {
+                            addLog("RX", WinnsenCodec.toHex(rxData), "Got ${rxData.size} bytes!")
+                            val resp = WinnsenCodec.parsePollResponse(rxData)
+                            if (resp != null) {
+                                addLog("OK", "--", "FOUND! ${port.path} @ $baud baud, station=${resp.station}")
+                                baudRate.value = baud
+                                station.value = resp.station
+                                _doorStates.value = resp.doorStates
+                                _lastResult.value = "DETECTED: ${port.path} @ $baud"
+                                _autoDetecting.value = false
+                                return@launch
+                            } else {
+                                addLog("SYS", "--", "Got data but not a valid Winnsen poll response")
+                            }
                         }
                     }
+
+                    // Raw read test: check if port has any unsolicited data
+                    try {
+                        val rawBuf = ByteArray(64)
+                        val available = hwSerial.rawRead(rawBuf, 500)
+                        if (available > 0) {
+                            val rawHex = WinnsenCodec.toHex(rawBuf.copyOf(available))
+                            addLog("RX", rawHex, "RAW data on ${port.path}! ($available bytes)")
+                        }
+                    } catch (_: Exception) {}
 
                     hwSerial.disconnect()
                 }
             }
 
-            addLog("ERR", "--", "Auto-detect failed — no port responded")
+            addLog("ERR", "--", "Auto-detect failed — no port responded at any baud/station")
             _lastResult.value = "NOT FOUND"
+            _autoDetecting.value = false
         }
     }
 
