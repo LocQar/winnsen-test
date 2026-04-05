@@ -5,14 +5,20 @@ import android.content.BroadcastReceiver
 import android.content.Context
 import android.content.Intent
 import android.content.IntentFilter
-import android.hardware.usb.UsbDevice
-import android.hardware.usb.UsbManager
+import android.hardware.usb.*
 import android.os.Build
 import android.util.Log
-import com.hoho.android.usbserial.driver.*
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.asStateFlow
 
+/**
+ * USB serial manager that handles both:
+ * 1. Standard USB-to-RS485 adapters (CH340, FTDI, etc.) via usb-serial-for-android
+ * 2. Winnsen control board (VID:05C6 Qualcomm) via raw USB bulk transfer
+ *
+ * The Winnsen board is a composite USB device with 5 interfaces.
+ * We scan each interface for bulk IN/OUT endpoints for serial comms.
+ */
 class SerialManager(private val context: Context) {
 
     companion object {
@@ -21,7 +27,10 @@ class SerialManager(private val context: Context) {
         private const val BAUD_RATE = 9600
         private const val WRITE_TIMEOUT_MS = 1000
         private const val READ_TIMEOUT_MS = 2000
-        private const val READ_CHUNK_SIZE = 64
+
+        // Winnsen control board identifiers
+        private const val WINNSEN_VID = 0x05C6
+        private const val WINNSEN_PID = 0x9025
     }
 
     enum class ConnectionState { DISCONNECTED, REQUESTING_PERMISSION, CONNECTED, ERROR }
@@ -35,13 +44,20 @@ class SerialManager(private val context: Context) {
     private val _connectedDeviceName = MutableStateFlow<String?>(null)
     val connectedDeviceName = _connectedDeviceName.asStateFlow()
 
-    // All USB devices visible to the tablet (for debug display)
     private val _detectedDevices = MutableStateFlow<List<String>>(emptyList())
     val detectedDevices = _detectedDevices.asStateFlow()
 
     val isConnected: Boolean get() = _connectionState.value == ConnectionState.CONNECTED
 
-    private var serialPort: UsbSerialPort? = null
+    // Raw USB handles for Winnsen board
+    private var usbConnection: UsbDeviceConnection? = null
+    private var usbInterface: UsbInterface? = null
+    private var endpointIn: UsbEndpoint? = null
+    private var endpointOut: UsbEndpoint? = null
+
+    // Also support standard serial library as fallback
+    private var serialPort: com.hoho.android.usbserial.driver.UsbSerialPort? = null
+
     private val usbManager: UsbManager = context.getSystemService(Context.USB_SERVICE) as UsbManager
 
     private val usbPermissionReceiver = object : BroadcastReceiver() {
@@ -54,7 +70,6 @@ class SerialManager(private val context: Context) {
                 } else {
                     _connectionState.value = ConnectionState.ERROR
                     _errorMessage.value = "USB permission denied"
-                    Log.w(TAG, "USB permission denied")
                 }
             }
         }
@@ -69,76 +84,83 @@ class SerialManager(private val context: Context) {
         }
     }
 
-    /**
-     * Scan all USB devices and list them for debugging.
-     * Then try to find a serial driver (default prober + custom CDC/ACM fallback).
-     */
     fun connect() {
-        // Step 1: Log ALL USB devices the tablet can see
         val allDevices = usbManager.deviceList
         val deviceInfo = mutableListOf<String>()
 
         if (allDevices.isEmpty()) {
-            deviceInfo.add("No USB devices detected at all")
+            deviceInfo.add("No USB devices detected")
             _detectedDevices.value = deviceInfo
             _connectionState.value = ConnectionState.ERROR
             _errorMessage.value = "No USB devices found. Check USB cable."
-            Log.w(TAG, "No USB devices found")
             return
         }
 
-        for ((name, device) in allDevices) {
-            val info = "VID:${"%04X".format(device.vendorId)} PID:${"%04X".format(device.productId)} " +
-                "${device.productName ?: "Unknown"} [${device.deviceName}] " +
-                "class=${device.deviceClass} interfaces=${device.interfaceCount}"
+        // Log all devices with full detail
+        var winnsenDevice: UsbDevice? = null
+        for ((_, device) in allDevices) {
+            val info = buildString {
+                append("VID:${"%04X".format(device.vendorId)} PID:${"%04X".format(device.productId)} ")
+                append("${device.productName ?: "Unknown"} [${device.deviceName}] ")
+                append("class=${device.deviceClass} interfaces=${device.interfaceCount}")
+            }
             deviceInfo.add(info)
-            Log.i(TAG, "USB device: $info")
+
+            // Log detailed interface info
+            for (i in 0 until device.interfaceCount) {
+                val iface = device.getInterface(i)
+                val ifaceInfo = buildString {
+                    append("  iface[$i]: class=${iface.interfaceClass} sub=${iface.interfaceSubclass} ")
+                    append("proto=${iface.interfaceProtocol} endpoints=${iface.endpointCount}")
+                }
+                deviceInfo.add(ifaceInfo)
+                Log.i(TAG, ifaceInfo)
+
+                for (e in 0 until iface.endpointCount) {
+                    val ep = iface.getEndpoint(e)
+                    val dir = if (ep.direction == UsbConstants.USB_DIR_IN) "IN" else "OUT"
+                    val type = when (ep.type) {
+                        UsbConstants.USB_ENDPOINT_XFER_BULK -> "BULK"
+                        UsbConstants.USB_ENDPOINT_XFER_INT -> "INT"
+                        UsbConstants.USB_ENDPOINT_XFER_CONTROL -> "CTRL"
+                        UsbConstants.USB_ENDPOINT_XFER_ISOC -> "ISOC"
+                        else -> "?"
+                    }
+                    val epInfo = "    ep[$e]: $dir $type maxPacket=${ep.maxPacketSize}"
+                    deviceInfo.add(epInfo)
+                    Log.i(TAG, epInfo)
+                }
+            }
+
+            // Check if this is the Winnsen board
+            if (device.vendorId == WINNSEN_VID && device.productId == WINNSEN_PID) {
+                winnsenDevice = device
+            }
         }
         _detectedDevices.value = deviceInfo
 
-        // Step 2: Try default prober (CH340, FTDI, PL2303, CP210x)
-        var availableDrivers = UsbSerialProber.getDefaultProber().findAllDrivers(usbManager)
-
-        // Step 3: If no standard drivers found, try CDC/ACM driver on all devices
-        // (Winnsen boards may present as CDC/ACM serial devices)
-        if (availableDrivers.isEmpty()) {
-            Log.i(TAG, "No standard drivers. Trying CDC/ACM on all ${allDevices.size} devices...")
-
-            val customTable = ProbeTable()
-            for ((_, device) in allDevices) {
-                // Try CDC/ACM driver for each device
-                customTable.addProduct(device.vendorId, device.productId, CdcAcmSerialDriver::class.java)
+        // Priority: Winnsen board first, then try standard serial adapters
+        val targetDevice = winnsenDevice ?: run {
+            // Try standard serial library
+            val drivers = com.hoho.android.usbserial.driver.UsbSerialProber.getDefaultProber()
+                .findAllDrivers(usbManager)
+            if (drivers.isNotEmpty()) {
+                val driver = drivers[0]
+                // Use standard serial path
+                requestPermission(driver.device)
+                return
             }
-            val customProber = UsbSerialProber(customTable)
-            availableDrivers = customProber.findAllDrivers(usbManager)
 
-            if (availableDrivers.isEmpty()) {
-                // Step 4: Last resort — try all driver types
-                Log.i(TAG, "CDC/ACM failed. Trying all driver types...")
-                val bruteTable = ProbeTable()
-                for ((_, device) in allDevices) {
-                    bruteTable.addProduct(device.vendorId, device.productId, Ch34xSerialDriver::class.java)
-                    bruteTable.addProduct(device.vendorId, device.productId, FtdiSerialDriver::class.java)
-                    bruteTable.addProduct(device.vendorId, device.productId, ProlificSerialDriver::class.java)
-                    bruteTable.addProduct(device.vendorId, device.productId, Cp21xxSerialDriver::class.java)
-                }
-                val bruteProber = UsbSerialProber(bruteTable)
-                availableDrivers = bruteProber.findAllDrivers(usbManager)
-            }
-        }
-
-        if (availableDrivers.isEmpty()) {
-            val devList = deviceInfo.joinToString("\n")
+            // No known device found
             _connectionState.value = ConnectionState.ERROR
-            _errorMessage.value = "Found ${allDevices.size} USB device(s) but none recognized as serial.\n$devList"
-            Log.w(TAG, "No serial drivers matched")
+            _errorMessage.value = "No Winnsen board (VID:05C6) or serial adapter found"
             return
         }
 
-        Log.i(TAG, "Found ${availableDrivers.size} serial driver(s)")
-        val driver = availableDrivers[0]
-        val device = driver.device
+        requestPermission(targetDevice)
+    }
 
+    private fun requestPermission(device: UsbDevice) {
         if (usbManager.hasPermission(device)) {
             openDevice(device)
         } else {
@@ -153,63 +175,148 @@ class SerialManager(private val context: Context) {
     }
 
     private fun openDevice(device: UsbDevice) {
+        if (device.vendorId == WINNSEN_VID && device.productId == WINNSEN_PID) {
+            openWinnsenDevice(device)
+        } else {
+            openStandardSerial(device)
+        }
+    }
+
+    /**
+     * Open the Winnsen control board using raw USB bulk transfers.
+     * Scans all interfaces for bulk IN + OUT endpoint pairs.
+     */
+    private fun openWinnsenDevice(device: UsbDevice) {
         try {
-            // Try all probers to find the right driver
-            var driver = UsbSerialProber.getDefaultProber().findAllDrivers(usbManager)
-                .find { it.device == device }
+            val connection = usbManager.openDevice(device)
+                ?: throw IllegalStateException("Could not open USB device")
 
-            if (driver == null) {
-                // Try CDC/ACM
-                val customTable = ProbeTable()
-                customTable.addProduct(device.vendorId, device.productId, CdcAcmSerialDriver::class.java)
-                driver = UsbSerialProber(customTable).findAllDrivers(usbManager)
-                    .find { it.device == device }
-            }
+            // Scan all interfaces for bulk endpoints
+            var foundInterface: UsbInterface? = null
+            var foundIn: UsbEndpoint? = null
+            var foundOut: UsbEndpoint? = null
+            val triedInterfaces = mutableListOf<String>()
 
-            if (driver == null) {
-                // Try all types
-                val driverTypes = listOf(
-                    Ch34xSerialDriver::class.java,
-                    FtdiSerialDriver::class.java,
-                    ProlificSerialDriver::class.java,
-                    Cp21xxSerialDriver::class.java
-                )
-                for (driverType in driverTypes) {
-                    val table = ProbeTable()
-                    table.addProduct(device.vendorId, device.productId, driverType)
-                    driver = UsbSerialProber(table).findAllDrivers(usbManager)
-                        .find { it.device == device }
-                    if (driver != null) break
+            for (i in 0 until device.interfaceCount) {
+                val iface = device.getInterface(i)
+                var bulkIn: UsbEndpoint? = null
+                var bulkOut: UsbEndpoint? = null
+
+                for (e in 0 until iface.endpointCount) {
+                    val ep = iface.getEndpoint(e)
+                    if (ep.type == UsbConstants.USB_ENDPOINT_XFER_BULK) {
+                        if (ep.direction == UsbConstants.USB_DIR_IN) bulkIn = ep
+                        if (ep.direction == UsbConstants.USB_DIR_OUT) bulkOut = ep
+                    }
+                }
+
+                val status = "iface[$i] class=${iface.interfaceClass}: bulkIn=${bulkIn != null} bulkOut=${bulkOut != null}"
+                triedInterfaces.add(status)
+                Log.i(TAG, status)
+
+                if (bulkIn != null && bulkOut != null && foundInterface == null) {
+                    foundInterface = iface
+                    foundIn = bulkIn
+                    foundOut = bulkOut
+                    Log.i(TAG, "Using interface $i for serial comms")
                 }
             }
 
-            if (driver == null) throw IllegalStateException("No driver found for VID:${"%04X".format(device.vendorId)} PID:${"%04X".format(device.productId)}")
+            if (foundInterface == null || foundIn == null || foundOut == null) {
+                connection.close()
+                val detail = triedInterfaces.joinToString("\n")
+                throw IllegalStateException("No bulk IN+OUT endpoint pair found.\n$detail")
+            }
+
+            // Claim the interface
+            if (!connection.claimInterface(foundInterface, true)) {
+                connection.close()
+                throw IllegalStateException("Could not claim interface ${foundInterface.id}")
+            }
+
+            // Set baud rate via CDC SET_LINE_CODING if applicable
+            // This is a standard USB CDC request: 0x20 = SET_LINE_CODING
+            val lineCoding = byteArrayOf(
+                (BAUD_RATE and 0xFF).toByte(),
+                ((BAUD_RATE shr 8) and 0xFF).toByte(),
+                ((BAUD_RATE shr 16) and 0xFF).toByte(),
+                ((BAUD_RATE shr 24) and 0xFF).toByte(),
+                0x00, // 1 stop bit
+                0x00, // no parity
+                0x08  // 8 data bits
+            )
+            // Try to set line coding (may silently fail on non-CDC devices, that's OK)
+            connection.controlTransfer(
+                0x21, // bmRequestType: host-to-device, class, interface
+                0x20, // SET_LINE_CODING
+                0, foundInterface.id, lineCoding, lineCoding.size, WRITE_TIMEOUT_MS
+            )
+
+            // Enable DTR/RTS (SET_CONTROL_LINE_STATE)
+            connection.controlTransfer(
+                0x21, 0x22, // SET_CONTROL_LINE_STATE
+                0x03, // DTR + RTS
+                foundInterface.id, null, 0, WRITE_TIMEOUT_MS
+            )
+
+            usbConnection = connection
+            usbInterface = foundInterface
+            endpointIn = foundIn
+            endpointOut = foundOut
+
+            _connectionState.value = ConnectionState.CONNECTED
+            _connectedDeviceName.value = "Winnsen Board VID:${"%04X".format(device.vendorId)} iface=${foundInterface.id}"
+            _errorMessage.value = null
+            Log.i(TAG, "Connected to Winnsen board on interface ${foundInterface.id}")
+
+        } catch (e: Exception) {
+            _connectionState.value = ConnectionState.ERROR
+            _errorMessage.value = "Winnsen: ${e.message}"
+            Log.e(TAG, "Failed to open Winnsen device", e)
+        }
+    }
+
+    /**
+     * Fallback: open standard USB-serial adapter (CH340, FTDI, etc.)
+     */
+    private fun openStandardSerial(device: UsbDevice) {
+        try {
+            val drivers = com.hoho.android.usbserial.driver.UsbSerialProber.getDefaultProber()
+                .findAllDrivers(usbManager)
+            val driver = drivers.find { it.device == device }
+                ?: throw IllegalStateException("No serial driver for this device")
 
             val connection = usbManager.openDevice(device)
                 ?: throw IllegalStateException("Could not open USB device")
 
             val port = driver.ports[0]
             port.open(connection)
-            port.setParameters(BAUD_RATE, 8, UsbSerialPort.STOPBITS_1, UsbSerialPort.PARITY_NONE)
+            port.setParameters(BAUD_RATE, 8,
+                com.hoho.android.usbserial.driver.UsbSerialPort.STOPBITS_1,
+                com.hoho.android.usbserial.driver.UsbSerialPort.PARITY_NONE)
 
             serialPort = port
             _connectionState.value = ConnectionState.CONNECTED
-            _connectedDeviceName.value = "VID:${"%04X".format(device.vendorId)} PID:${"%04X".format(device.productId)} ${device.productName ?: ""} (${device.deviceName})"
+            _connectedDeviceName.value = "${device.productName ?: "USB Serial"} (${device.deviceName})"
             _errorMessage.value = null
-            Log.i(TAG, "Connected to ${device.deviceName} at $BAUD_RATE baud")
         } catch (e: Exception) {
             _connectionState.value = ConnectionState.ERROR
-            _errorMessage.value = "Failed: ${e.message}"
-            Log.e(TAG, "Failed to open USB device", e)
+            _errorMessage.value = "Serial: ${e.message}"
+            Log.e(TAG, "Failed to open serial device", e)
         }
     }
 
     fun sendAndReceive(txData: ByteArray, expectedResponseLen: Int): ByteArray? {
+        // Raw USB path (Winnsen board)
+        if (usbConnection != null && endpointOut != null && endpointIn != null) {
+            return rawSendAndReceive(txData, expectedResponseLen)
+        }
+
+        // Standard serial library path
         val port = serialPort ?: return null
         return try {
             port.write(txData, WRITE_TIMEOUT_MS)
-
-            val buffer = ByteArray(READ_CHUNK_SIZE)
+            val buffer = ByteArray(64)
             val accumulated = mutableListOf<Byte>()
             val deadline = System.currentTimeMillis() + READ_TIMEOUT_MS
 
@@ -233,9 +340,61 @@ class SerialManager(private val context: Context) {
         }
     }
 
+    private fun rawSendAndReceive(txData: ByteArray, expectedResponseLen: Int): ByteArray? {
+        val conn = usbConnection ?: return null
+        val epOut = endpointOut ?: return null
+        val epIn = endpointIn ?: return null
+
+        return try {
+            // Send
+            val written = conn.bulkTransfer(epOut, txData, txData.size, WRITE_TIMEOUT_MS)
+            if (written < 0) {
+                Log.e(TAG, "Bulk write failed: $written")
+                return null
+            }
+            Log.d(TAG, "Wrote $written bytes")
+
+            // Receive — accumulate until we have enough
+            val buffer = ByteArray(epIn.maxPacketSize.coerceAtLeast(64))
+            val accumulated = mutableListOf<Byte>()
+            val deadline = System.currentTimeMillis() + READ_TIMEOUT_MS
+
+            while (accumulated.size < expectedResponseLen && System.currentTimeMillis() < deadline) {
+                val timeout = (deadline - System.currentTimeMillis()).toInt().coerceAtLeast(1)
+                val bytesRead = conn.bulkTransfer(epIn, buffer, buffer.size, timeout.coerceAtMost(READ_TIMEOUT_MS))
+                if (bytesRead > 0) {
+                    for (i in 0 until bytesRead) accumulated.add(buffer[i])
+                    Log.d(TAG, "Read $bytesRead bytes, total=${accumulated.size}")
+                }
+            }
+
+            if (accumulated.size >= expectedResponseLen) {
+                accumulated.toByteArray().copyOfRange(0, expectedResponseLen)
+            } else {
+                Log.w(TAG, "Timeout: got ${accumulated.size}/$expectedResponseLen bytes")
+                null
+            }
+        } catch (e: Exception) {
+            Log.e(TAG, "Raw USB I/O error", e)
+            null
+        }
+    }
+
     fun disconnect() {
+        // Raw USB cleanup
+        try {
+            usbInterface?.let { usbConnection?.releaseInterface(it) }
+            usbConnection?.close()
+        } catch (_: Exception) {}
+        usbConnection = null
+        usbInterface = null
+        endpointIn = null
+        endpointOut = null
+
+        // Serial library cleanup
         try { serialPort?.close() } catch (_: Exception) {}
         serialPort = null
+
         _connectionState.value = ConnectionState.DISCONNECTED
         _connectedDeviceName.value = null
     }
