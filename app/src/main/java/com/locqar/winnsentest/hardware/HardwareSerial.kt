@@ -75,6 +75,7 @@ class HardwareSerial {
 
     private var inputStream: FileInputStream? = null
     private var outputStream: FileOutputStream? = null
+    private var nativeFd: Int = -1
 
     /**
      * Scan for all available serial device files.
@@ -126,6 +127,7 @@ class HardwareSerial {
 
     /**
      * Connect to a specific serial port with the given baud rate.
+     * Uses JNI native termios for proper baud rate configuration.
      */
     fun connect(path: String, baud: Int = 9600) {
         disconnect()
@@ -139,31 +141,44 @@ class HardwareSerial {
         }
 
         try {
-            // Find available stty tools
-            _sttyTools.value = NativeSerial.findAvailableTools()
-            Log.i(TAG, "Available tools: ${_sttyTools.value}")
+            // Method 1: JNI native open with termios (preferred)
+            val fd = SerialPortJNI.nativeOpen(path, baud)
 
-            // Try to set baud rate
-            _baudRateSet.value = NativeSerial.configureBaudRate(path, baud)
-            Log.i(TAG, "Baud rate configured: ${_baudRateSet.value}")
+            if (fd >= 0) {
+                // Create FileDescriptor from native fd using reflection
+                val fileDescriptor = FileDescriptor()
+                val fdField = FileDescriptor::class.java.getDeclaredField("descriptor")
+                fdField.isAccessible = true
+                fdField.setInt(fileDescriptor, fd)
 
-            // Open the device file for read/write
-            outputStream = FileOutputStream(file)
-            inputStream = FileInputStream(file)
+                inputStream = FileInputStream(fileDescriptor)
+                outputStream = FileOutputStream(fileDescriptor)
+                nativeFd = fd
+                _baudRateSet.value = true
 
-            _connectionState.value = ConnectionState.CONNECTED
-            _connectedPort.value = path
-            _errorMessage.value = null
-            Log.i(TAG, "Connected to $path")
+                _connectionState.value = ConnectionState.CONNECTED
+                _connectedPort.value = path
+                _errorMessage.value = null
+                Log.i(TAG, "Connected via JNI to $path @ $baud baud (fd=$fd)")
+            } else {
+                // Method 2: Fallback to Java file open + stty
+                Log.w(TAG, "JNI open failed, falling back to Java FileStream")
+                _sttyTools.value = NativeSerial.findAvailableTools()
+                _baudRateSet.value = NativeSerial.configureBaudRate(path, baud)
 
-        } catch (e: IOException) {
+                outputStream = FileOutputStream(file)
+                inputStream = FileInputStream(file)
+
+                _connectionState.value = ConnectionState.CONNECTED
+                _connectedPort.value = path
+                _errorMessage.value = null
+                Log.i(TAG, "Connected via Java to $path (baud set: ${_baudRateSet.value})")
+            }
+
+        } catch (e: Exception) {
             _connectionState.value = ConnectionState.ERROR
             _errorMessage.value = "Cannot open $path: ${e.message}"
             Log.e(TAG, "Failed to open $path", e)
-        } catch (e: SecurityException) {
-            _connectionState.value = ConnectionState.ERROR
-            _errorMessage.value = "Permission denied: $path (may need root)"
-            Log.e(TAG, "Permission denied for $path", e)
         }
     }
 
@@ -210,6 +225,10 @@ class HardwareSerial {
     fun disconnect() {
         try { inputStream?.close() } catch (_: Exception) {}
         try { outputStream?.close() } catch (_: Exception) {}
+        if (nativeFd >= 0) {
+            try { SerialPortJNI.nativeClose(nativeFd) } catch (_: Exception) {}
+            nativeFd = -1
+        }
         inputStream = null
         outputStream = null
         _connectionState.value = ConnectionState.DISCONNECTED
